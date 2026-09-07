@@ -1,13 +1,13 @@
 # dsh-pve
 
-A DeepSeek Harness plugin for inspecting and managing Proxmox VE (PVE) through conversation, authenticated with a PVE API token.
+A DeepSeek Harness plugin for inspecting and managing Proxmox VE (PVE) through conversation, authenticated with a PVE API token or a username/password (ticket) login.
 
 ## Why dsh-pve
 
 - Inspect nodes, QEMU VMs, LXC containers, storage, network, firewall, cluster, backup, HA, replication, Ceph, users, groups, roles and pools through conversation.
 - Manage power state, clone, migrate, snapshot, resize and move disks, create/delete guests and storages, and manage backup/replication/firewall rules.
 - Every write operation triggers a mandatory native user-approval prompt — the model cannot bypass it.
-- The API token secret is kept in the local DSH credential store and never echoed back to the browser or the model.
+- Credentials (API token secret or login password) are kept in the local DSH credential store and never echoed back to the browser or the model.
 
 ## Requirements
 
@@ -15,7 +15,7 @@ A DeepSeek Harness plugin for inspecting and managing Proxmox VE (PVE) through c
 | --- | --- |
 | Node.js | 20.11 or newer |
 | DeepSeek Harness | 0.1.2-rc.1 |
-| Proxmox VE | PVE2 JSON API (API Token auth) |
+| Proxmox VE | PVE2 JSON API (API Token auth on 6.0+, username/password ticket auth on 5.x) |
 
 ## Installation (for the agent)
 
@@ -53,11 +53,14 @@ In DSH Web: **Settings → Plugins → Proxmox VE control**.
 | Field | Description |
 | --- | --- |
 | Base URL | e.g. `https://pve.example.com:8006` |
-| Token ID | `user@realm!tokenid`, e.g. `monitor@pve!dsh` |
-| Token Secret | The token UUID; stored write-only, never read back. |
-| Skip TLS verification | Enable for self-signed internal hosts. |
+| Authentication | `API Token` (PVE 6.0+) or `Username / password` (PVE 5.x compatible) |
+| Token ID | `user@realm!tokenid`, e.g. `monitor@pve!dsh` — token mode only |
+| Token Secret | The token UUID; stored write-only — token mode only |
+| Username | e.g. `root@pam` — password mode only |
+| Password | The login password; stored write-only — password mode only |
+| Skip TLS verification | Enable for self-signed internal hosts (5.x and 6.0+) |
 
-Create the API token in PVE (**Datacenter → Permissions → API Token**) with the least privilege required — read-only unless you want the agent to manage resources.
+PVE 6.0+ → create an API token (**Datacenter → Permissions → API Token**) with the least privilege required. PVE 5.x has no API token → switch to username/password mode.
 
 ## Tools
 

@@ -19,6 +19,7 @@ export const SETTINGS_NAMESPACE = "pve";
 // API Token 的 secret 部分走凭证库（仅写不读）；tokenId / baseUrl / 开关属于非敏感，
 // 走 settings namespace（可回显核对）。
 const SECRET_REF = "PVE_API_TOKEN_SECRET";
+const PASSWORD_REF = "PVE_API_PASSWORD";
 const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const REQUEST_TIMEOUT_MS = 20_000;
 const TOOL_TIMEOUT_MS = 90_000;
@@ -46,7 +47,7 @@ Destructive actions to treat with maximum care (state it explicitly before calli
 
 Async operations return a task ID in the form "UPID:node:...". After any write tool that returns a UPID, poll pve_task_status (and pve_task_log for output) to confirm the result instead of assuming success.
 
-The API token secret is loaded from the local credential store and is NEVER echoed in tool output, approval prompts, or your responses. Never ask the user to paste a token secret into chat.
+Credentials (the API token secret — or the login password in password mode) are loaded from the local credential store and are NEVER echoed in tool output, approval prompts, or your responses. Never ask the user to paste a token secret or password into chat.
 
 Prefer listing first: call pve_node_list for node names, pve_cluster_resources (optionally type=vm|ct|storage) for an overview, pve_vm_list/pve_ct_list per node, and pve_storage_list for storage names, before drilling into a specific ID.
 Before an update, call the matching get/config tool first so you only change fields the user asked about.
@@ -68,6 +69,16 @@ export const Config = Schema.object({
     .default(false)
     .description(
       "Skip TLS certificate verification. Enable for self-signed Proxmox hosts.",
+    ),
+  authMode: Schema.string()
+    .default("token")
+    .description(
+      'Authentication mode: "token" (API token, PVE 6.0+) or "password" (username/password ticket auth, works on PVE 5.x).',
+    ),
+  username: Schema.string()
+    .default("")
+    .description(
+      'PVE username for password auth, e.g. root@pam. Only used when authMode is "password".',
     ),
 });
 
@@ -120,6 +131,13 @@ function sanitize(value, key) {
 
 function textOut(value) {
   return [{ type: "text", text: String(value) }];
+}
+
+// password 模式下：带 ticket 的 Cookie，非 GET 请求再附 CSRF 令牌。
+function ticketHeaders(ticket, csrf, method) {
+  const headers = { Cookie: `PVEAuthCookie=${ticket}` };
+  if (method !== "GET") headers["CSRFPreventionToken"] = csrf;
+  return headers;
 }
 
 function errorDetail(text) {
@@ -2233,15 +2251,22 @@ export function apply(ctx, config = {}) {
     baseUrl: "",
     tokenId: "",
     allowInsecureTls: false,
+    authMode: "token",
+    username: "",
     ...config,
   };
   validateCredentialRef(SECRET_REF, "PVE_API_TOKEN_SECRET");
+  validateCredentialRef(PASSWORD_REF, "PVE_API_PASSWORD");
 
   let activeConfig = () => entryConfig;
   ctx.inject(["settings"], (sctx) => {
     const scope = sctx.settings.register(SETTINGS_NAMESPACE, Config, {
       base: entryConfig,
-      validate: () => {},
+      validate: (value) => {
+        if (value.authMode && !["token", "password"].includes(value.authMode)) {
+          throw new Error('authMode must be "token" or "password".');
+        }
+      },
     });
     activeConfig = () => scope.get();
     sctx.effect(() => () => {
@@ -2255,9 +2280,16 @@ export function apply(ctx, config = {}) {
     return normalizeBaseUrl(activeConfig().baseUrl);
   }
 
-  async function resolveAuth() {
-    const { tokenId } = activeConfig();
-    const tok = String(tokenId ?? "").trim();
+  // password 模式下的 ticket 缓存（PVE ticket 默认 2 小时有效）。
+  let ticketState = null; // { ticket, csrf, expiresAt }
+
+  async function authenticate(method) {
+    const cfg = activeConfig();
+    if ((cfg.authMode ?? "token") === "password") {
+      const t = await ensureTicket();
+      return ticketHeaders(t.ticket, t.csrf, method);
+    }
+    const tok = String(cfg.tokenId ?? "").trim();
     if (!tok)
       throw new Error(
         "PVE API token id is not configured. Set it in Settings → Plugins (user@realm!tokenid).",
@@ -2267,12 +2299,59 @@ export function apply(ctx, config = {}) {
       throw new Error(
         `Credential ${SECRET_REF} (API token secret) is not configured. Set it in Settings → Plugins.`,
       );
-    return { tokenId: tok, secret: secret.value };
+    return { Authorization: `PVEAPIToken ${tok}=${secret.value}` };
+  }
+
+  async function ensureTicket() {
+    const now = Date.now();
+    if (ticketState && ticketState.expiresAt > now + 60_000) return ticketState;
+    const cfg = activeConfig();
+    const username = String(cfg.username ?? "").trim();
+    if (!username)
+      throw new Error(
+        'PVE username is not configured. Set it in Settings → Plugins (e.g. root@pam), with authMode "password".',
+      );
+    const pw = await ctx.credentials.resolve(PASSWORD_REF);
+    if (!pw?.value)
+      throw new Error(
+        `Credential ${PASSWORD_REF} (PVE login password) is not configured. Set it in Settings → Plugins.`,
+      );
+    const baseUrl = await resolveBaseUrl();
+    const { allowInsecureTls } = cfg;
+    const body = new URLSearchParams({ username, password: pw.value }).toString();
+    const res = await rawRequest({
+      url: `${baseUrl}/access/ticket`,
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+      rejectUnauthorized: !allowInsecureTls,
+    });
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`PVE login failed (${res.status}): ${errorDetail(res.text)}`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(res.text);
+    } catch {
+      throw new Error("PVE login returned an invalid JSON response.");
+    }
+    const data = parsed?.data;
+    if (!data?.ticket) {
+      throw new Error("PVE login response did not include a ticket.");
+    }
+    ticketState = {
+      ticket: data.ticket,
+      csrf: data.CSRFPreventionToken ?? "",
+      expiresAt: now + 110 * 60_000,
+    };
+    return ticketState;
   }
 
   async function api(method, path, params = {}, { parentSignal } = {}) {
     const baseUrl = await resolveBaseUrl();
-    const { tokenId, secret } = await resolveAuth();
     const { allowInsecureTls } = activeConfig();
     let url;
     try {
@@ -2280,10 +2359,6 @@ export function apply(ctx, config = {}) {
     } catch {
       throw new Error(`Failed to build Proxmox API URL for path ${path}.`);
     }
-    const headers = {
-      Accept: "application/json",
-      Authorization: `PVEAPIToken ${tokenId}=${secret}`,
-    };
     let body;
     const useQuery = method === "GET" || method === "DELETE";
     if (useQuery) {
@@ -2293,11 +2368,21 @@ export function apply(ctx, config = {}) {
       const sp = new URLSearchParams();
       for (const [k, v] of Object.entries(params)) sp.append(k, String(v));
       body = sp.toString();
-      headers["Content-Type"] = "application/x-www-form-urlencoded";
     }
-    const attempts = method === "GET" ? 2 : 1;
-    let lastError;
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
+
+    const isPassword = (activeConfig().authMode ?? "token") === "password";
+    // 仅 GET 允许网络级重试；非 GET 在 5xx/网络错误时直接失败，避免重复执行写操作。
+    let remaining = method === "GET" ? 2 : 1;
+    let reauthorized = false;
+
+    for (;;) {
+      const headers = {
+        Accept: "application/json",
+        ...(await authenticate(method)),
+      };
+      if (body !== undefined)
+        headers["Content-Type"] = "application/x-www-form-urlencoded";
+
       let res;
       try {
         res = await rawRequest({
@@ -2317,12 +2402,15 @@ export function apply(ctx, config = {}) {
           throw new Error(
             `Proxmox VE request cancelled or timed out: ${method} ${path}`,
           );
-        lastError = error;
-        if (attempt + 1 < attempts) continue;
+        if (remaining > 1) {
+          remaining -= 1;
+          continue;
+        }
         throw new Error(
           `Proxmox VE request failed: ${method} ${path}: ${error?.message ?? String(error)}`,
         );
       }
+
       if (res.status >= 200 && res.status < 300) {
         if (!res.text) return null;
         let parsed;
@@ -2333,15 +2421,21 @@ export function apply(ctx, config = {}) {
         }
         return parsed && Object.hasOwn(parsed, "data") ? parsed.data : parsed;
       }
-      if (attempt + 1 < attempts && RETRYABLE_STATUS.has(res.status)) continue;
+
+      // password 模式下 401 表示 ticket 过期：清缓存、重新登录后重试一次（安全，请求已服务端拒绝）。
+      if (res.status === 401 && isPassword && !reauthorized) {
+        ticketState = null;
+        reauthorized = true;
+        continue;
+      }
+      if (remaining > 1 && RETRYABLE_STATUS.has(res.status)) {
+        remaining -= 1;
+        continue;
+      }
       throw new Error(
         `Proxmox VE API ${res.status} ${method} ${path}: ${errorDetail(res.text)}`,
       );
     }
-    throw (
-      lastError ??
-      new Error(`Proxmox VE request failed unexpectedly: ${method} ${path}`)
-    );
   }
 
   // 写操作审批网关：命中写工具的调用一律要求原生用户审批，模型无法绕过。
@@ -2458,15 +2552,15 @@ export function apply(ctx, config = {}) {
         const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
         const body = Buffer.concat([headerParts, file, footer]);
         const baseUrl = await resolveBaseUrl();
-        const { tokenId, secret } = await resolveAuth();
         const { allowInsecureTls } = activeConfig();
+        const authHeaders = await authenticate("POST");
         const url = `${baseUrl}/nodes/${encodeURIComponent(node)}/storage/${encodeURIComponent(storage)}/upload`;
         const res = await rawRequest({
           url,
           method: "POST",
           headers: {
             Accept: "application/json",
-            Authorization: `PVEAPIToken ${tokenId}=${secret}`,
+            ...authHeaders,
             "Content-Type": `multipart/form-data; boundary=${boundary}`,
           },
           body,
@@ -2498,5 +2592,7 @@ export const internals = Object.freeze({
   UPID_PATTERN,
   SETTINGS_NAMESPACE,
   SECRET_REF,
+  PASSWORD_REF,
+  ticketHeaders,
   CATALOG,
 });

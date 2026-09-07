@@ -8,6 +8,8 @@ const {
   sanitize,
   resolveArgs,
   formatResult,
+  ticketHeaders,
+  PASSWORD_REF,
   CATALOG,
 } = internals;
 
@@ -100,6 +102,12 @@ test("formatResult adds task-polling hint for write results", () => {
 test("formatResult pretty-prints objects and sanitizes them", () => {
   const s = formatResult({ a: 1, password: "x" }, { write: false });
   assert.equal(s, JSON.stringify({ a: 1, password: "[REDACTED]" }, null, 2));
+});
+
+test("ticketHeaders: cookie always, CSRF only for non-GET", () => {
+  assert.deepEqual(ticketHeaders("TICKET", "CSRF", "GET"), { Cookie: "PVEAuthCookie=TICKET" });
+  assert.deepEqual(ticketHeaders("TICKET", "CSRF", "POST"), { Cookie: "PVEAuthCookie=TICKET", CSRFPreventionToken: "CSRF" });
+  assert.equal(PASSWORD_REF, "PVE_API_PASSWORD");
 });
 
 test("catalog integrity: unique names, path params declared, spot-check write flags", () => {
