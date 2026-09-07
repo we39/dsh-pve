@@ -117,8 +117,14 @@ test("ticketHeaders: cookie always, CSRF only for non-GET", () => {
 });
 
 test("apiUrl prepends /api2/json; normalizeBaseUrl strips a trailing one", () => {
-  assert.equal(apiUrl("https://h:8006", "/version"), "https://h:8006/api2/json/version");
-  assert.equal(apiUrl("https://h:8006", "/access/ticket"), "https://h:8006/api2/json/access/ticket");
+  assert.equal(
+    apiUrl("https://h:8006", "/version"),
+    "https://h:8006/api2/json/version",
+  );
+  assert.equal(
+    apiUrl("https://h:8006", "/access/ticket"),
+    "https://h:8006/api2/json/access/ticket",
+  );
   assert.equal(normalizeBaseUrl("https://h:8006/api2/json"), "https://h:8006");
 });
 
