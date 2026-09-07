@@ -105,8 +105,13 @@ test("formatResult pretty-prints objects and sanitizes them", () => {
 });
 
 test("ticketHeaders: cookie always, CSRF only for non-GET", () => {
-  assert.deepEqual(ticketHeaders("TICKET", "CSRF", "GET"), { Cookie: "PVEAuthCookie=TICKET" });
-  assert.deepEqual(ticketHeaders("TICKET", "CSRF", "POST"), { Cookie: "PVEAuthCookie=TICKET", CSRFPreventionToken: "CSRF" });
+  assert.deepEqual(ticketHeaders("TICKET", "CSRF", "GET"), {
+    Cookie: "PVEAuthCookie=TICKET",
+  });
+  assert.deepEqual(ticketHeaders("TICKET", "CSRF", "POST"), {
+    Cookie: "PVEAuthCookie=TICKET",
+    CSRFPreventionToken: "CSRF",
+  });
   assert.equal(PASSWORD_REF, "PVE_API_PASSWORD");
 });
 

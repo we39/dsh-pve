@@ -2318,7 +2318,10 @@ export function apply(ctx, config = {}) {
       );
     const baseUrl = await resolveBaseUrl();
     const { allowInsecureTls } = cfg;
-    const body = new URLSearchParams({ username, password: pw.value }).toString();
+    const body = new URLSearchParams({
+      username,
+      password: pw.value,
+    }).toString();
     const res = await rawRequest({
       url: `${baseUrl}/access/ticket`,
       method: "POST",
@@ -2330,7 +2333,9 @@ export function apply(ctx, config = {}) {
       rejectUnauthorized: !allowInsecureTls,
     });
     if (res.status < 200 || res.status >= 300) {
-      throw new Error(`PVE login failed (${res.status}): ${errorDetail(res.text)}`);
+      throw new Error(
+        `PVE login failed (${res.status}): ${errorDetail(res.text)}`,
+      );
     }
     let parsed;
     try {
