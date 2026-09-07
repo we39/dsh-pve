@@ -1,56 +1,105 @@
 # dsh-pve
 
-通过对话检查和操控 Proxmox VE（PVE）。基于 PVE2 JSON API，使用 API Token 鉴权。
+A DeepSeek Harness plugin for inspecting and managing Proxmox VE (PVE) through conversation, authenticated with a PVE API token.
 
-## 功能
+## Why dsh-pve
 
-覆盖 PVE 全量管理面并通过对话调用，包括：
+- Inspect nodes, QEMU VMs, LXC containers, storage, network, firewall, cluster, backup, HA, replication, Ceph, users, groups, roles and pools through conversation.
+- Manage power state, clone, migrate, snapshot, resize and move disks, create/delete guests and storages, and manage backup/replication/firewall rules.
+- Every write operation triggers a mandatory native user-approval prompt — the model cannot bypass it.
+- The API token secret is kept in the local DSH credential store and never echoed back to the browser or the model.
 
-- **概览**：`pve_version`、`pve_cluster_status`、`pve_cluster_resources`、`pve_node_list`、`pve_node_rrd`
-- **虚拟机 (QEMU)**：列表/配置/状态/性能，创建/删除/克隆/迁移/快照/磁盘 resize/move/迁移，电源开关，guest-agent，QEMU monitor
-- **容器 (LXC)**：同上的核心 CRUD + 电源 + 快照 + resize
-- **存储**：列表/创建/更新/删除，内容/卷管理，上传 ISO/模板，RRD
-- **网络**：接口 CRUD + reload，DNS / hosts / time 管理
-- **防火墙**：cluster / node / vm / ct 四个作用域的 rules、aliases、ipset、options、log、refs
-- **访问控制**：用户/组/角色/域/ACL
-- **高可用 (HA)**：资源/组/状态，迁移与重定位
-- **备份 / 复制**：vzdump 任务 CRUD、立即备份、replication 任务 CRUD
-- **Ceph**：状态/OSD/池/MON/MDS/FS/日志（只读为主 + 池 CRUD）
-- **池 / 系统**：resource pools、节点服务启停、任务轮询（`pve_task_status` / `pve_task_log`）
+## Requirements
 
-所有写操作（创建/修改/删除/电源/执行）都会触发 DSH 原生用户审批弹窗，模型无法绕过。
+| Component | Supported baseline |
+| --- | --- |
+| Node.js | 20.11 or newer |
+| DeepSeek Harness | 0.1.2-rc.1 |
+| Proxmox VE | PVE2 JSON API (API Token auth) |
 
-## 安装
+## Installation (for the agent)
+
+Once installed, the agent gains 232 `pve_*` tools automatically.
+
+Local development:
 
 ```bash
-# 本地目录开发期安装到 profile
-dsh plugin --profile <name> add ./dsh-pve
+npm ci
+dsh plugin --profile <name> add link:/absolute/path/to/dsh-pve
+```
 
-# 或开发期 overlay 加载，无需打包
+Published, pinned tag (recommended):
+
+```bash
+dsh plugin --profile <name> add github:easyv-ai/dsh-pve#v<version>
+```
+
+Development branch (testing only):
+
+```bash
+dsh plugin --profile <name> add github:easyv-ai/dsh-pve
+```
+
+Restart the selected profile after installation. For a no-packaging dev loop, load the overlay directly:
+
+```bash
 dsh --profile <name> --patch ./cordis.patch.yml
 ```
 
-## 配置（设置 → 插件）
+## Configuration
 
-| 字段 | 说明 |
+In DSH Web: **Settings → Plugins → Proxmox VE control**.
+
+| Field | Description |
 | --- | --- |
-| Base URL | PVE 地址，如 `https://pve.example.com` |
-| Token ID | API Token 标识，如 `monitoring@pve!dsh`（`PVEAPIToken` 中 `=` 前的部分） |
-| Token Secret | API Token 密钥（UUID），仅存本地凭证库，不回显 |
-| 跳过 TLS 校验 | 自签名内网证书需勾选 |
+| Base URL | e.g. `https://pve.example.com:8006` |
+| Token ID | `user@realm!tokenid`, e.g. `monitor@pve!dsh` |
+| Token Secret | The token UUID; stored write-only, never read back. |
+| Skip TLS verification | Enable for self-signed internal hosts. |
 
-在 PVE 中为指定用户创建 API Token（数据中心 → 权限 → API Token），按需授予只读或管理员权限。
+Create the API token in PVE (**Datacenter → Permissions → API Token**) with the least privilege required — read-only unless you want the agent to manage resources.
 
-## 开发
+## Tools
+
+232 tools (116 read-only / 116 write) across 13 domains. All write tools require native user approval.
+
+| Domain | Tools | Scope |
+| --- | --- | --- |
+| Cluster & overview | 8 | version, status, resources index, tasks, log, nextid, options |
+| Nodes & tasks | 23 | status, config, services, disks, syslog, apt, SMART, task polling |
+| Network | 12 | interface CRUD + reload, DNS, hosts, time |
+| VMs (QEMU) | 22 | config, power, snapshot, clone, migrate, resize, move-disk, guest-agent, monitor |
+| Containers (LXC) | 15 | config, power, snapshot, clone, migrate, resize |
+| Storage | 11 | CRUD, content/volumes, upload, RRD |
+| Firewall | 76 | rules / aliases / ipset / options / log across cluster·node·VM·CT scopes |
+| Access control | 21 | users, groups, roles, domains, ACL |
+| Pools | 5 | resource pools |
+| HA | 13 | resources, groups, status, migrate / relocate |
+| Backup | 6 | vzdump jobs + run-now |
+| Replication | 9 | job CRUD, schedule-now, status / log |
+| Ceph | 11 | status, OSD, pools, MON / MDS / FS, logs |
+
+See **[docs/tools.md](docs/tools.md)** for the full per-tool reference (name, method, path, description).
+
+Async operations return a `UPID:...` task id — the agent polls `pve_task_status` / `pve_task_log` to confirm completion.
+
+## Security
+
+- Mandatory approval on every write operation — the model cannot bypass it.
+- Secrets, tokens, and passwords are redacted before any response reaches the model.
+- All PVE-returned data is treated as untrusted, never as instructions.
+
+## Development
 
 ```bash
 npm install
 npm run verify   # node --check + node:test
 ```
 
-## 结构
+## Structure
 
-- `index.js` — host 侧：泛型执行引擎 + 全量端点目录表（数据驱动）+ 写操作审批网关
-- `client.js` — 设置页表单卡片（settings 子注册 key `pve`）
-- `cordis.patch.yml` — bundle patch（insert id `pve` / name `dsh-pve`）
-- `test/index.test.js` — `node:test` 单测（纯函数 + 目录完整性）
+- `index.js` — generic execution engine + full endpoint catalog + write-approval gateway
+- `client.js` — settings-page form card (slot key `pve`)
+- `cordis.patch.yml` — bundle patch (insert id `pve` / name `dsh-pve`)
+- `docs/tools.md` — full tool reference
+- `test/index.test.js` — `node:test` unit tests
