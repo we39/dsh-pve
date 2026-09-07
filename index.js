@@ -108,7 +108,10 @@ function normalizeBaseUrl(input) {
     throw new Error(
       "Proxmox VE base URL must not contain a query string or fragment.",
     );
-  return url.toString().replace(/\/+$/, "");
+  const normalized = url.toString().replace(/\/+$/, "");
+  return normalized.endsWith("/api2/json")
+    ? normalized.slice(0, -"/api2/json".length)
+    : normalized;
 }
 
 function toFormValue(value) {
@@ -138,6 +141,11 @@ function ticketHeaders(ticket, csrf, method) {
   const headers = { Cookie: `PVEAuthCookie=${ticket}` };
   if (method !== "GET") headers["CSRFPreventionToken"] = csrf;
   return headers;
+}
+
+// PVE 的 JSON API 统一挂在 /api2/json 前缀下；baseUrl 配置为裸源站。
+function apiUrl(baseUrl, path) {
+  return `${baseUrl}/api2/json${path}`;
 }
 
 function errorDetail(text) {
@@ -211,6 +219,17 @@ function rawRequest({
   signal,
 }) {
   return new Promise((resolve, reject) => {
+    // Node 不显式设 Content-Length 时会用 Transfer-Encoding: chunked，老版
+    // pve-api-daemon 对 chunked POST 回 501——这里强制写长度，兼容 PVE 5.x。
+    if (
+      body !== undefined &&
+      body !== null &&
+      headers["Content-Length"] === undefined
+    ) {
+      headers["Content-Length"] = String(
+        typeof body === "string" ? Buffer.byteLength(body) : body.length,
+      );
+    }
     let u;
     try {
       u = new URL(url);
@@ -2239,9 +2258,12 @@ function approvalReasonForWrite(exec) {
     }
     shown[k] = SENSITIVE_KEY.test(k) ? "[REDACTED]" : v;
   }
-  const scary = /delete|destroy|remove|purge|reboot|shutdown|stop/i.test(
-    def?.name ?? "",
-  );
+  const scary =
+    /delete|destroy|remove|purge|reboot|shutdown|stop|relocate/i.test(
+      def?.name ?? "",
+    ) ||
+    (typeof exec.arguments?.action === "string" &&
+      /reboot|shutdown|stop|reset|relocate/i.test(exec.arguments.action));
   const prefix = scary ? "⚠️ DESTRUCTIVE/OFFLINE " : "";
   return `${prefix}Proxmox VE write operation "${exec.name}": ${def?.method ?? ""} ${path} ${JSON.stringify(shown)}. This changes PVE state; review and approve to proceed, reject to cancel.`;
 }
@@ -2323,7 +2345,7 @@ export function apply(ctx, config = {}) {
       password: pw.value,
     }).toString();
     const res = await rawRequest({
-      url: `${baseUrl}/access/ticket`,
+      url: apiUrl(baseUrl, "/access/ticket"),
       method: "POST",
       headers: {
         Accept: "application/json",
@@ -2360,7 +2382,7 @@ export function apply(ctx, config = {}) {
     const { allowInsecureTls } = activeConfig();
     let url;
     try {
-      url = new URL(baseUrl + path);
+      url = new URL(apiUrl(baseUrl, path));
     } catch {
       throw new Error(`Failed to build Proxmox API URL for path ${path}.`);
     }
@@ -2559,7 +2581,10 @@ export function apply(ctx, config = {}) {
         const baseUrl = await resolveBaseUrl();
         const { allowInsecureTls } = activeConfig();
         const authHeaders = await authenticate("POST");
-        const url = `${baseUrl}/nodes/${encodeURIComponent(node)}/storage/${encodeURIComponent(storage)}/upload`;
+        const url = apiUrl(
+          baseUrl,
+          `/nodes/${encodeURIComponent(node)}/storage/${encodeURIComponent(storage)}/upload`,
+        );
         const res = await rawRequest({
           url,
           method: "POST",
@@ -2599,5 +2624,6 @@ export const internals = Object.freeze({
   SECRET_REF,
   PASSWORD_REF,
   ticketHeaders,
+  apiUrl,
   CATALOG,
 });
