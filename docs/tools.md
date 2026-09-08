@@ -1,9 +1,8 @@
 # dsh-pve tools
 
-Generated from `index.js`. 151 catalog entries + 2 special write tools.
+Generated from `index.js`. 230 catalog entries + 2 special write tools = 232 total (116 read-only / 116 write).
 
-
-## Read-only tools
+## Read-only tools (116)
 
 | Name | Description |
 | --- | --- |
@@ -43,6 +42,7 @@ Generated from `index.js`. 151 catalog entries + 2 special write tools.
 | `pve_storage_content` | List content of a storage (volumes, images, ISOs, backups). Read-only. |
 | `pve_storage_volume_get` | Get attributes of a single volume. Read-only. |
 | `pve_storage_rrd` | Read storage RRD performance stats. Read-only. |
+| `pve_vm_list` | List all VMs on a node (optionally include config with "full"). Read-only. |
 | `pve_vm_config` | Get current VM configuration. Read-only. |
 | `pve_vm_pending` | Get VM configuration including pending changes. Read-only. |
 | `pve_vm_status` | Get the current running status of a VM. Read-only. |
@@ -72,6 +72,42 @@ Generated from `index.js`. 151 catalog entries + 2 special write tools.
 | `pve_ha_groups` | List HA groups. Read-only. |
 | `pve_backup_list` | List vzdump backup jobs. Read-only. |
 | `pve_backup_get` | Read a vzdump backup job definition. Read-only. |
+| `pve_cluster_firewall_rules` | List firewall rules in this scope. Read-only. |
+| `pve_cluster_firewall_rule_get` | Get a single firewall rule by position. Read-only. |
+| `pve_cluster_firewall_options` | Get firewall options for this scope. Read-only. |
+| `pve_cluster_firewall_log` | Read the firewall log for this scope. Read-only. |
+| `pve_cluster_firewall_aliases` | List IP/network aliases in this scope. Read-only. |
+| `pve_cluster_firewall_alias_get` | Read an alias. Read-only. |
+| `pve_cluster_firewall_ipset` | List IPSets in this scope. Read-only. |
+| `pve_cluster_firewall_ipset_get` | Read an IPSet and its contents. Read-only. |
+| `pve_cluster_firewall_refs` | List possible IPSet/alias references allowed in rule source/dest. Read-only. |
+| `pve_node_firewall_rules` | List firewall rules in this scope. Read-only. |
+| `pve_node_firewall_rule_get` | Get a single firewall rule by position. Read-only. |
+| `pve_node_firewall_options` | Get firewall options for this scope. Read-only. |
+| `pve_node_firewall_log` | Read the firewall log for this scope. Read-only. |
+| `pve_node_firewall_aliases` | List IP/network aliases in this scope. Read-only. |
+| `pve_node_firewall_alias_get` | Read an alias. Read-only. |
+| `pve_node_firewall_ipset` | List IPSets in this scope. Read-only. |
+| `pve_node_firewall_ipset_get` | Read an IPSet and its contents. Read-only. |
+| `pve_node_firewall_refs` | List possible IPSet/alias references allowed in rule source/dest. Read-only. |
+| `pve_vm_firewall_rules` | List firewall rules in this scope. Read-only. |
+| `pve_vm_firewall_rule_get` | Get a single firewall rule by position. Read-only. |
+| `pve_vm_firewall_options` | Get firewall options for this scope. Read-only. |
+| `pve_vm_firewall_log` | Read the firewall log for this scope. Read-only. |
+| `pve_vm_firewall_aliases` | List IP/network aliases in this scope. Read-only. |
+| `pve_vm_firewall_alias_get` | Read an alias. Read-only. |
+| `pve_vm_firewall_ipset` | List IPSets in this scope. Read-only. |
+| `pve_vm_firewall_ipset_get` | Read an IPSet and its contents. Read-only. |
+| `pve_vm_firewall_refs` | List possible IPSet/alias references allowed in rule source/dest. Read-only. |
+| `pve_ct_firewall_rules` | List firewall rules in this scope. Read-only. |
+| `pve_ct_firewall_rule_get` | Get a single firewall rule by position. Read-only. |
+| `pve_ct_firewall_options` | Get firewall options for this scope. Read-only. |
+| `pve_ct_firewall_log` | Read the firewall log for this scope. Read-only. |
+| `pve_ct_firewall_aliases` | List IP/network aliases in this scope. Read-only. |
+| `pve_ct_firewall_alias_get` | Read an alias. Read-only. |
+| `pve_ct_firewall_ipset` | List IPSets in this scope. Read-only. |
+| `pve_ct_firewall_ipset_get` | Read an IPSet and its contents. Read-only. |
+| `pve_ct_firewall_refs` | List possible IPSet/alias references allowed in rule source/dest. Read-only. |
 | `pve_replication_list` | List cluster replication jobs. Read-only. |
 | `pve_replication_get` | Read a replication job configuration. Read-only. |
 | `pve_replication_status` | Get replication job status on a node. Read-only. |
@@ -87,7 +123,7 @@ Generated from `index.js`. 151 catalog entries + 2 special write tools.
 | `pve_ceph_disks` | List local disks (for Ceph OSD selection). Read-only. |
 | `pve_ceph_log` | Read the Ceph log. Read-only. |
 
-## Write tools
+## Write tools (114 catalog + 2 special)
 
 | Name | Description |
 | --- | --- |
@@ -109,6 +145,7 @@ Generated from `index.js`. 151 catalog entries + 2 special write tools.
 | `pve_storage_volume_delete` | PERMANENTLY delete a volume. WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_vm_create` | Create or restore a virtual machine. WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_vm_delete` | PERMANENTLY DESTROY a VM. WRITE OPERATION: triggers a mandatory approval prompt. When purge=true all owned disks are deleted too — this is irreversible, treat with maximum care. |
+| `pve_vm_power` | Change VM power state (start, stop, shutdown, reset, resume, suspend). WRITE OPERATION: triggers a mandatory approval prompt. "stop" is abrupt; "shutdown" is graceful. |
 | `pve_vm_config_set` | Set VM configuration options (synchronous). WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_vm_clone` | Clone a VM or template. WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_vm_migrate` | Migrate a VM to another node. WRITE OPERATION: triggers a mandatory approval prompt. |
@@ -120,6 +157,7 @@ Generated from `index.js`. 151 catalog entries + 2 special write tools.
 | `pve_vm_monitor` | Execute a raw QEMU monitor command. WRITE OPERATION: triggers a mandatory approval prompt. HIGH RISK — arbitrary QEMU control-plane access. |
 | `pve_vm_sendkey` | Send a key event to a VM (like pressing a keyboard key). WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_vm_template` | Convert a VM to a template. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_agent` | Run a QEMU guest-agent command inside the VM (info, get-osinfo, exec, shutdown, fsfreeze, ping, ...). WRITE OPERATION: triggers a mandatory approval prompt. "exec" runs arbitrary commands inside the guest — high risk. |
 | `pve_ct_create` | Create or restore an LXC container. WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_ct_delete` | PERMANENTLY DESTROY a container. WRITE OPERATION: triggers a mandatory approval prompt. When purge=true all owned volumes are deleted too — irreversible. |
 | `pve_ct_power` | Change container power state (start, stop, shutdown, resume, suspend). WRITE OPERATION: triggers a mandatory approval prompt. |
@@ -157,6 +195,46 @@ Generated from `index.js`. 151 catalog entries + 2 special write tools.
 | `pve_backup_update` | Update a vzdump backup job. WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_backup_delete` | Delete a vzdump backup job. WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_backup_run` | Backup one or more guests now. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_cluster_firewall_rule_create` | Create a firewall rule in this scope. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_cluster_firewall_rule_update` | Update a firewall rule. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_cluster_firewall_rule_delete` | Delete a firewall rule. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_cluster_firewall_options_set` | Set firewall options for this scope. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_cluster_firewall_alias_create` | Create an IP/network alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_cluster_firewall_alias_update` | Update an alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_cluster_firewall_alias_delete` | Delete an alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_cluster_firewall_ipset_create` | Create an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_cluster_firewall_ipset_add` | Add an IP/network to an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_cluster_firewall_ipset_delete` | Delete an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_node_firewall_rule_create` | Create a firewall rule in this scope. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_node_firewall_rule_update` | Update a firewall rule. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_node_firewall_rule_delete` | Delete a firewall rule. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_node_firewall_options_set` | Set firewall options for this scope. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_node_firewall_alias_create` | Create an IP/network alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_node_firewall_alias_update` | Update an alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_node_firewall_alias_delete` | Delete an alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_node_firewall_ipset_create` | Create an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_node_firewall_ipset_add` | Add an IP/network to an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_node_firewall_ipset_delete` | Delete an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_firewall_rule_create` | Create a firewall rule in this scope. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_firewall_rule_update` | Update a firewall rule. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_firewall_rule_delete` | Delete a firewall rule. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_firewall_options_set` | Set firewall options for this scope. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_firewall_alias_create` | Create an IP/network alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_firewall_alias_update` | Update an alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_firewall_alias_delete` | Delete an alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_firewall_ipset_create` | Create an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_firewall_ipset_add` | Add an IP/network to an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_vm_firewall_ipset_delete` | Delete an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_ct_firewall_rule_create` | Create a firewall rule in this scope. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_ct_firewall_rule_update` | Update a firewall rule. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_ct_firewall_rule_delete` | Delete a firewall rule. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_ct_firewall_options_set` | Set firewall options for this scope. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_ct_firewall_alias_create` | Create an IP/network alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_ct_firewall_alias_update` | Update an alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_ct_firewall_alias_delete` | Delete an alias. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_ct_firewall_ipset_create` | Create an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_ct_firewall_ipset_add` | Add an IP/network to an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
+| `pve_ct_firewall_ipset_delete` | Delete an IPSet. WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_replication_create` | Create a replication job. WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_replication_update` | Update a replication job. WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_replication_delete` | Delete a replication job. WRITE OPERATION: triggers a mandatory approval prompt. |
@@ -165,4 +243,3 @@ Generated from `index.js`. 151 catalog entries + 2 special write tools.
 | `pve_ceph_pool_delete` | PERMANENTLY destroy a Ceph pool and its data. WRITE OPERATION: triggers a mandatory approval prompt. |
 | `pve_node_execute` | Special write tool (hand-written, not in CATALOG). |
 | `pve_storage_upload` | Special write tool (hand-written, not in CATALOG). |
-
