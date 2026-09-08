@@ -1,5 +1,7 @@
 # dsh-pve
 
+[简体中文](./README.zh-CN.md)
+
 A DeepSeek Harness plugin for inspecting and managing Proxmox VE (PVE) through conversation, authenticated with a PVE API token or a username/password (ticket) login.
 
 ## Why dsh-pve
