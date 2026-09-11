@@ -2264,8 +2264,8 @@ function approvalReasonForWrite(exec) {
     ) ||
     (typeof exec.arguments?.action === "string" &&
       /reboot|shutdown|stop|reset|relocate/i.test(exec.arguments.action));
-  const prefix = scary ? "⚠️ DESTRUCTIVE/OFFLINE " : "";
-  return `${prefix}Proxmox VE write operation "${exec.name}": ${def?.method ?? ""} ${path} ${JSON.stringify(shown)}. This changes PVE state; review and approve to proceed, reject to cancel.`;
+  const prefix = scary ? "⚠️ 破坏性/离线操作 " : "";
+  return `${prefix}Proxmox VE 写操作 "${exec.name}"：${def?.method ?? ""} ${path} ${JSON.stringify(shown)}。这会修改 PVE 状态，请确认后批准执行，拒绝则取消。`;
 }
 
 export function apply(ctx, config = {}) {
