@@ -33,13 +33,13 @@ dsh plugin --profile <name> add link:/absolute/path/to/dsh-pve
 Published, pinned tag (recommended):
 
 ```bash
-dsh plugin --profile <name> add github:easyv-ai/dsh-pve#v<version>
+dsh plugin --profile <name> add github:we39/dsh-pve#v<version>
 ```
 
 Development branch (testing only):
 
 ```bash
-dsh plugin --profile <name> add github:easyv-ai/dsh-pve
+dsh plugin --profile <name> add github:we39/dsh-pve
 ```
 
 Restart the selected profile after installation. For a no-packaging dev loop, load the overlay directly:

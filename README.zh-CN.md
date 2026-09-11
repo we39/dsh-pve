@@ -31,13 +31,13 @@ dsh plugin --profile <name> add link:/absolute/path/to/dsh-pve
 发布版，固定 tag（推荐）：
 
 ```bash
-dsh plugin --profile <name> add github:easyv-ai/dsh-pve#v<version>
+dsh plugin --profile <name> add github:we39/dsh-pve#v<version>
 ```
 
 开发分支（仅测试）：
 
 ```bash
-dsh plugin --profile <name> add github:easyv-ai/dsh-pve
+dsh plugin --profile <name> add github:we39/dsh-pve
 ```
 
 安装后重启所选 profile。若要无打包开发，可直接加载 overlay：
