@@ -2,6 +2,9 @@
 // 鉴权两种：API Token（settings.tokenId + 凭证库 PVE_API_TOKEN_SECRET）与
 // 账号密码（settings.username + 凭证库 PVE_API_PASSWORD）。密钥/密码只写不读，
 // baseUrl / tokenId / username / authMode / allowInsecureTls 存 settings，非 secret 可回显。
+// 只 inject slots。远端门面（remote.settings / remote.credentials）刻意不写进 inject：
+// cordis 4.0.2 中任一 inject 项缺席都会让整个插件永久停在 INACTIVE，卡片连同
+// 其它功能一起消失；改为调用时用 ctx.get 按需解析，缺席时只让卡片报错。
 window.__ModuleLoader__.load({
   id: "dsh-pve",
   factory: (require) => {
@@ -15,7 +18,7 @@ window.__ModuleLoader__.load({
     const PASSWORD_REF = "PVE_API_PASSWORD";
     const SETTINGS_NS = "pve";
     const MASK = "*".repeat(28);
-    const inject = ["slots", "remote", "remote.credentials", "remote.settings"];
+    const inject = ["slots"];
 
     const STRINGS = {
       zh: {
@@ -254,6 +257,15 @@ window.__ModuleLoader__.load({
       },
     };
 
+    const HOST_UNSUPPORTED = "HOST_UNSUPPORTED";
+
+    function messageOf(e) {
+      const message = String(e && e.message ? e.message : e);
+      return message === HOST_UNSUPPORTED
+        ? "This DSH host is too old (no remote.settings facade), so Proxmox VE settings cannot be read or written. Upgrade and reopen the settings page."
+        : message;
+    }
+
     function PveCard(props) {
       const face = props.pveCard;
       const [status, setStatus] = react.useState({ loaded: false });
@@ -302,7 +314,9 @@ window.__ModuleLoader__.load({
             if (r.username) setUsernameDraft(r.username);
             setTlsDraft(r.allowInsecureTls === true);
           })
-          .catch(() => {});
+          .catch((e) => {
+            if (alive) setError(messageOf(e));
+          });
         return () => {
           alive = false;
         };
@@ -776,17 +790,157 @@ window.__ModuleLoader__.load({
       });
     }
 
+    // 宿主远端门面（dsh 0.1.2+）：settings / credentials 由 dsh-api-gateway 以
+    // remote.<ns> 之名挂载。必须用 ctx.get 读而不是 ctx.remote.<ns>：未声明 inject 的
+    // 点号访问会直接抛错，而 ctx.get 在服务缺席时只返回 undefined。
+    function remoteNamespace(ctx, ns) {
+      return typeof ctx.get === "function" ? ctx.get("remote." + ns) : undefined;
+    }
+
+    function requireNamespace(ctx, ns) {
+      const api = remoteNamespace(ctx, ns);
+      if (!api) throw new Error(HOST_UNSUPPORTED);
+      return api;
+    }
+
+    function mustOk(res) {
+      if (!res || res.ok === false)
+        throw (res && res.error) ?? new Error("remote call failed");
+      return res.value;
+    }
+
+    // 设置入口注册：不同代际的宿主暴露的槛位不同，按优先级选第一个可用的。
+    //   settings.section      0.2.0+  设置页左侧独立分区（root/list）
+    //   settings.plugins.tab  0.1.7+  “插件”分区内的标签页（root/list）
+    //   settings.plugin.item  ≤0.1.5  内嵌卡片（keyed）；0.1.7 起已从槛位目录移除
+    // 只注册一个，避免同一个卡片出现两次。
+    function registerSettingsEntry(ctx, face) {
+      const candidates = [
+        {
+          name: "settings.section",
+          kind: "list",
+          scope: "root",
+          options: {
+            name: "settings.section",
+            id: "pve",
+            order: 18,
+            label: "Proxmox VE",
+          },
+          component: () => react.createElement(PveCard, { pveCard: face }),
+        },
+        {
+          name: "settings.plugins.tab",
+          kind: "list",
+          scope: "root",
+          options: {
+            name: "settings.plugins.tab",
+            id: "pve",
+            order: 102,
+            label: "Proxmox VE",
+          },
+          component: () => react.createElement(PveCard, { pveCard: face }),
+        },
+        {
+          name: "settings.plugin.item",
+          kind: "keyed",
+          options: {
+            name: "settings.plugin.item",
+            key: "pve",
+            inject: () => ({ pveCard: face }),
+          },
+          component: PveCard,
+        },
+      ];
+      // 没有声明探测接口（ctx.slots.spec）的老宿主：保持原先的注册方式，由各自宿主消费。
+      if (typeof ctx.slots.spec !== "function") {
+        for (const candidate of candidates.slice(1)) {
+          ctx.slots.inject(candidate.name, () =>
+            ctx.slots.register(candidate.options, candidate.component),
+          );
+        }
+        return;
+      }
+      ctx.effect(() => {
+        const available = new Map();
+        let active;
+        let unregister;
+        let queued = false;
+        let stopped = false;
+        const reconcile = () => {
+          if (stopped || queued) return;
+          queued = true;
+          // 在声明/撤销回调之外注册，并把同一轮槛位变化合并为一次切换，不制造重复入口。
+          queueMicrotask(() => {
+            queued = false;
+            if (stopped) return;
+            const next = candidates
+              .map((candidate) => available.get(candidate.name))
+              .find(Boolean);
+            if (next === active) return;
+            unregister?.();
+            unregister = void 0;
+            active = void 0;
+            if (next) {
+              try {
+                unregister = ctx.slots.register(next.options, next.component);
+                active = next;
+              } catch (error) {
+                // Fiber 卸载可能先于本控制器的清理；待执行微任务不得复活入口。
+                if (error?.code !== "INACTIVE_EFFECT") throw error;
+                stop();
+              }
+            }
+          });
+        };
+        const waits = [];
+        const stop = () => {
+          if (stopped) return;
+          stopped = true;
+          const disposeActive = unregister;
+          unregister = void 0;
+          active = void 0;
+          disposeActive?.();
+          for (const dispose of waits.reverse()) dispose?.();
+          available.clear();
+        };
+        try {
+          for (const candidate of candidates)
+            waits.push(
+              ctx.slots.inject(candidate.name, () => {
+                const spec = ctx.slots.spec(candidate.name);
+                if (
+                  spec?.kind !== candidate.kind ||
+                  (candidate.scope && spec.scope !== candidate.scope)
+                )
+                  return;
+                // 每个声明生命周期用新对象标识；同 tick 撤销并重声明同名槛时也须重挂。
+                const lifetime = { ...candidate };
+                available.set(candidate.name, lifetime);
+                reconcile();
+                return () => {
+                  if (available.get(candidate.name) === lifetime)
+                    available.delete(candidate.name);
+                  reconcile();
+                };
+              }),
+            );
+        } catch (error) {
+          stop();
+          throw error;
+        }
+        return stop;
+      }, "dsh-pve: settings navigation");
+    }
+
     function apply(ctx) {
-      const mustOk = (res) => {
-        if (!res || res.ok === false)
-          throw (res && res.error) ?? new Error("remote call failed");
-        return res.value;
-      };
       const face = {
         describe: async () => {
+          const credentials = remoteNamespace(ctx, "credentials");
+          const settings = remoteNamespace(ctx, "settings");
+          if (!credentials || !settings) throw new Error(HOST_UNSUPPORTED);
           const [credRes, setRes] = await Promise.all([
-            ctx.remote.credentials.describe([SECRET_REF, PASSWORD_REF]),
-            ctx.remote.settings.describe(),
+            credentials.describe([SECRET_REF, PASSWORD_REF]),
+            settings.describe(),
           ]);
           const creds = credRes?.ok ? (credRes.value ?? {}) : {};
           const namespaces = setRes?.ok ? (setRes.value?.namespaces ?? []) : [];
@@ -815,69 +969,60 @@ window.__ModuleLoader__.load({
           };
         },
         setSecret: (value) =>
-          ctx.remote.credentials.set(SECRET_REF, value).then(mustOk),
+          requireNamespace(ctx, "credentials").set(SECRET_REF, value).then(mustOk),
         setPassword: (value) =>
-          ctx.remote.credentials.set(PASSWORD_REF, value).then(mustOk),
+          requireNamespace(ctx, "credentials")
+            .set(PASSWORD_REF, value)
+            .then(mustOk),
         setBaseUrl: (value) =>
-          ctx.remote.settings
+          requireNamespace(ctx, "settings")
             .update(SETTINGS_NS, { baseUrl: value }, undefined)
             .then(mustOk),
         setTokenId: (value) =>
-          ctx.remote.settings
+          requireNamespace(ctx, "settings")
             .update(SETTINGS_NS, { tokenId: value }, undefined)
             .then(mustOk),
         setUsername: (value) =>
-          ctx.remote.settings
+          requireNamespace(ctx, "settings")
             .update(SETTINGS_NS, { username: value }, undefined)
             .then(mustOk),
         setAuthMode: (value) =>
-          ctx.remote.settings
+          requireNamespace(ctx, "settings")
             .update(SETTINGS_NS, { authMode: value }, undefined)
             .then(mustOk),
         setAllowInsecureTls: (value) =>
-          ctx.remote.settings
+          requireNamespace(ctx, "settings")
             .update(SETTINGS_NS, { allowInsecureTls: value }, undefined)
             .then(mustOk),
         unsetSecret: () =>
-          ctx.remote.credentials.unset(SECRET_REF).then(mustOk),
+          requireNamespace(ctx, "credentials").unset(SECRET_REF).then(mustOk),
         unsetPassword: () =>
-          ctx.remote.credentials.unset(PASSWORD_REF).then(mustOk),
+          requireNamespace(ctx, "credentials").unset(PASSWORD_REF).then(mustOk),
         unsetBaseUrl: () =>
-          ctx.remote.settings
-            .mutate(
-              SETTINGS_NS,
-              [{ op: "unset", path: ["baseUrl"] }],
-              undefined,
-            )
+          requireNamespace(ctx, "settings")
+            .mutate(SETTINGS_NS, [{ op: "unset", path: ["baseUrl"] }], undefined)
             .then(mustOk),
         unsetTokenId: () =>
-          ctx.remote.settings
-            .mutate(
-              SETTINGS_NS,
-              [{ op: "unset", path: ["tokenId"] }],
-              undefined,
-            )
+          requireNamespace(ctx, "settings")
+            .mutate(SETTINGS_NS, [{ op: "unset", path: ["tokenId"] }], undefined)
             .then(mustOk),
         localePreference: async () => {
-          const res = await ctx.remote.settings.describe();
-          if (!res?.ok) return "";
-          const namespaces = res.value?.namespaces ?? [];
-          const locale = namespaces.find((n) => n?.ns === "locale");
-          const pref = locale?.value?.preference;
-          return typeof pref === "string" ? pref : "";
+          const settings = remoteNamespace(ctx, "settings");
+          if (!settings || !settings.describe) return "";
+          try {
+            const res = await settings.describe();
+            if (!res?.ok) return "";
+            const namespaces = res.value?.namespaces ?? [];
+            const locale = namespaces.find((n) => n?.ns === "locale");
+            const pref = locale?.value?.preference;
+            return typeof pref === "string" ? pref : "";
+          } catch {
+            return "";
+          }
         },
       };
 
-      ctx.slots.inject("settings.plugin.item", () =>
-        ctx.slots.register(
-          {
-            name: "settings.plugin.item",
-            key: "pve",
-            inject: () => ({ pveCard: face }),
-          },
-          PveCard,
-        ),
-      );
+      registerSettingsEntry(ctx, face);
     }
 
     exports.apply = apply;

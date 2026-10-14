@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { internals } from "../index.js";
+import { internals, unwrapVolatile } from "../index.js";
 
 const {
   normalizeBaseUrl,
@@ -13,6 +13,32 @@ const {
   PASSWORD_REF,
   CATALOG,
 } = internals;
+
+test("unwrapVolatile returns plain values unchanged", () => {
+  assert.equal(unwrapVolatile("https://pve.example.com"), "https://pve.example.com");
+  assert.equal(unwrapVolatile(true), true);
+  assert.equal(unwrapVolatile(null), null);
+});
+
+test("unwrapVolatile unwraps a cosmokit Volatile reference recursively, including nested objects/arrays", () => {
+  const VOLATILE_WRITE = Symbol.for("cosmokit.volatile.write");
+  const volatile = (value) => ({ [VOLATILE_WRITE]: true, get: () => value });
+  const wrapped = {
+    baseUrl: volatile("https://pve.example.com"),
+    allowInsecureTls: volatile(false),
+    nested: { tokenId: volatile("root@pam!dsh") },
+    list: [volatile("a"), "b"],
+  };
+  assert.equal(
+    JSON.stringify(unwrapVolatile(wrapped)),
+    JSON.stringify({
+      baseUrl: "https://pve.example.com",
+      allowInsecureTls: false,
+      nested: { tokenId: "root@pam!dsh" },
+      list: ["a", "b"],
+    }),
+  );
+});
 
 test("normalizeBaseUrl accepts http(s), strips trailing slash", () => {
   assert.equal(

@@ -16,7 +16,7 @@ A DeepSeek Harness plugin for inspecting and managing Proxmox VE (PVE) through c
 | Component | Supported baseline |
 | --- | --- |
 | Node.js | 20.11 or newer |
-| DeepSeek Harness | 0.1.2-rc.1 |
+| DeepSeek Harness | 0.2.0-rc.2 |
 | Proxmox VE | PVE2 JSON API (API Token auth on 6.0+, username/password ticket auth on 5.x) |
 
 ## Installation (for the agent)

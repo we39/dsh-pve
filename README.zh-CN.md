@@ -14,7 +14,7 @@
 | 组件 | 支持基线 |
 | --- | --- |
 | Node.js | 20.11 或更高 |
-| DeepSeek Harness | `0.1.2-rc.1` |
+| DeepSeek Harness | `0.2.0-rc.2` |
 | Proxmox VE | PVE2 JSON API（6.0+ 用 API Token；5.x 用用户名/密码 ticket） |
 
 ## 安装（给 agent 用）

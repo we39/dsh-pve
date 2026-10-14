@@ -16,6 +16,31 @@ export const inject = ["tools", "systemPrompt", "credentials"];
 // 必须与 client.js 中 slots.register 的 key 保持一致。
 export const SETTINGS_NAMESPACE = "pve";
 
+// 新宿主（0.1.7+）的 settings 服务只允许运行时读写标了 .volatile() 的字段：
+// 未标记的字段 settings.describe 读回空，settings.update/mutate 报
+// `Config field "..." is not volatile`。设置页卡片要保存 baseUrl 等字段，
+// 所以必须标记。标记后 schemastery 会把字段值包成 Volatile 引用，消费配置前
+// 需 unwrapVolatile。旧宿主忽略 volatile meta，值仍是普通值，原样返回。
+const VOLATILE_WRITE = Symbol.for("cosmokit.volatile.write");
+
+export function unwrapVolatile(value) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    VOLATILE_WRITE in value &&
+    typeof value.get === "function"
+  ) {
+    return unwrapVolatile(value.get());
+  }
+  if (Array.isArray(value)) return value.map(unwrapVolatile);
+  if (value !== null && typeof value === "object") {
+    const out = {};
+    for (const key of Object.keys(value)) out[key] = unwrapVolatile(value[key]);
+    return out;
+  }
+  return value;
+}
+
 // API Token 的 secret 部分走凭证库（仅写不读）；tokenId / baseUrl / 开关属于非敏感，
 // 走 settings namespace（可回显核对）。
 const SECRET_REF = "PVE_API_TOKEN_SECRET";
@@ -57,26 +82,31 @@ The PVE API accepts many optional parameters you can pass via the per-tool "opti
 export const Config = Schema.object({
   baseUrl: Schema.string()
     .default("")
+    .volatile()
     .description(
       "Proxmox VE base URL, e.g. https://pve.example.com. When empty, resolve from settings.",
     ),
   tokenId: Schema.string()
     .default("")
+    .volatile()
     .description(
       'PVE API token identifier, e.g. user@realm!tokenid (the part before the "=" in PVEAPIToken).',
     ),
   allowInsecureTls: Schema.boolean()
     .default(false)
+    .volatile()
     .description(
       "Skip TLS certificate verification. Enable for self-signed Proxmox hosts.",
     ),
   authMode: Schema.string()
     .default("token")
+    .volatile()
     .description(
       'Authentication mode: "token" (API token, PVE 6.0+) or "password" (username/password ticket auth, works on PVE 5.x).',
     ),
   username: Schema.string()
     .default("")
+    .volatile()
     .description(
       'PVE username for password auth, e.g. root@pam. Only used when authMode is "password".',
     ),
@@ -2269,28 +2299,53 @@ function approvalReasonForWrite(exec) {
 }
 
 export function apply(ctx, config = {}) {
-  const entryConfig = {
+  const entryConfig = unwrapVolatile({
     baseUrl: "",
     tokenId: "",
     allowInsecureTls: false,
     authMode: "token",
     username: "",
     ...config,
-  };
+  });
   validateCredentialRef(SECRET_REF, "PVE_API_TOKEN_SECRET");
   validateCredentialRef(PASSWORD_REF, "PVE_API_PASSWORD");
 
+  const validateConfigValue = (value) => {
+    if (value.authMode && !["token", "password"].includes(value.authMode)) {
+      throw new Error('authMode must be "token" or "password".');
+    }
+  };
+
+  // 当前生效配置：settings 服务可用时以其解析值为准，否则回退为入口配置。
+  // 0.1.7+ 宿主的 settings 服务不再提供 register/scope，只有 describe/update/mutate，
+  // loader 直接从导出的 Config 发现 schema；旧宿主仍走 register。
   let activeConfig = () => entryConfig;
   ctx.inject(["settings"], (sctx) => {
-    const scope = sctx.settings.register(SETTINGS_NAMESPACE, Config, {
-      base: entryConfig,
-      validate: (value) => {
-        if (value.authMode && !["token", "password"].includes(value.authMode)) {
-          throw new Error('authMode must be "token" or "password".');
-        }
-      },
-    });
-    activeConfig = () => scope.get();
+    const settings = sctx.settings;
+    const scope =
+      typeof settings.register === "function"
+        ? settings.register(SETTINGS_NAMESPACE, Config, {
+            base: entryConfig,
+            validate: validateConfigValue,
+          })
+        : null;
+    const descriptorOf = () => {
+      try {
+        return settings
+          .describe?.()
+          ?.find?.((entry) => entry?.ns === SETTINGS_NAMESPACE);
+      } catch {
+        return undefined;
+      }
+    };
+    const currentConfig = (descriptor = scope ? undefined : descriptorOf()) =>
+      unwrapVolatile(
+        scope?.get() ??
+          (descriptor?.value
+            ? { ...entryConfig, ...descriptor.value }
+            : entryConfig),
+      );
+    activeConfig = () => currentConfig();
     sctx.effect(() => () => {
       activeConfig = () => entryConfig;
     });
