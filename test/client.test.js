@@ -181,16 +181,18 @@ async function faceFrom(remote) {
   return host.registered[0].component().props.pveCard;
 }
 
-test("describe throws HOST_UNSUPPORTED when remote.settings/credentials are absent", async () => {
+test("describe reports hostUnsupported when remote.settings/credentials are absent", async () => {
   const face = await faceFrom({});
-  await assert.rejects(() => face.describe(), /HOST_UNSUPPORTED/);
+  const r = await face.describe();
+  assert.equal(r.hostUnsupported, true);
 });
 
-test("describe succeeds and reports configured flags when remote services are present", async () => {
+test("describe succeeds and reports the legacy single-source config as a pending import", async () => {
   const remote = {
     credentials: {
       async describe(refs) {
-        assert.equal(JSON.stringify(refs), JSON.stringify(["PVE_API_TOKEN_SECRET", "PVE_API_PASSWORD"]));
+        assert.ok(refs.includes("PVE_API_TOKEN_SECRET"));
+        assert.ok(refs.includes("PVE_API_PASSWORD"));
         return { ok: true, value: { PVE_API_TOKEN_SECRET: { configured: true } } };
       },
     },
@@ -203,6 +205,7 @@ test("describe succeeds and reports configured flags when remote services are pr
               {
                 ns: "pve",
                 value: { baseUrl: "https://pve.example.com", tokenId: "root@pam!dsh" },
+                revision: 1,
               },
             ],
           },
@@ -212,8 +215,55 @@ test("describe succeeds and reports configured flags when remote services are pr
   };
   const face = await faceFrom(remote);
   const r = await face.describe();
-  assert.equal(r.baseConfigured, true);
-  assert.equal(r.tokenConfigured, true);
-  assert.equal(r.secretConfigured, true);
-  assert.equal(r.passwordConfigured, false);
+  assert.equal(r.hostUnsupported, false);
+  assert.equal(r.sources.length, 0);
+  assert.ok(r.legacy);
+  assert.equal(r.legacy.baseUrl, "https://pve.example.com");
+  assert.equal(r.legacy.tokenId, "root@pam!dsh");
+  assert.equal(r.legacy.secretConfigured, true);
+  assert.equal(r.legacy.passwordConfigured, false);
+});
+
+test("describe with multiple sources reports per-source secret/password flags", async () => {
+  const remote = {
+    credentials: {
+      async describe(refs) {
+        assert.ok(refs.includes("AK_A"));
+        assert.ok(refs.includes("SK_B"));
+        return { ok: true, value: { AK_A: { configured: true }, SK_B: { configured: true } } };
+      },
+    },
+    settings: {
+      async describe() {
+        return {
+          ok: true,
+          value: {
+            namespaces: [
+              {
+                ns: "pve",
+                value: {
+                  sources: [
+                    { id: "id-a", name: "a", baseUrl: "https://a", authMode: "token", akRef: "AK_A" },
+                    { id: "id-b", name: "b", baseUrl: "https://b", authMode: "password", skRef: "SK_B" },
+                  ],
+                  defaultSource: "id-a",
+                },
+                revision: 3,
+              },
+            ],
+          },
+        };
+      },
+    },
+  };
+  const face = await faceFrom(remote);
+  const r = await face.describe();
+  assert.equal(r.unconfirmed, false);
+  assert.equal(r.defaultSource, "id-a");
+  assert.equal(r.revision, 3);
+  assert.equal(r.legacy, null);
+  assert.equal(r.sources.length, 2);
+  assert.equal(r.sources[0].secretConfigured, true);
+  assert.equal(r.sources[1].passwordConfigured, true);
+  assert.equal(r.sources[1].secretConfigured, false);
 });

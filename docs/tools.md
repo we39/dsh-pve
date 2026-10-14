@@ -1,11 +1,12 @@
 # dsh-pve tools
 
-Generated from `index.js`. 230 catalog entries + 2 special write tools = 232 total (116 read-only / 116 write).
+Generated from `index.js`. 230 catalog entries + 2 special write tools + 1 sources tool = 233 total (117 read-only / 116 write). Every tool except `pve_sources` also accepts an optional `source` argument (see README).
 
-## Read-only tools (116)
+## Read-only tools (117)
 
 | Name | Description |
 | --- | --- |
+| `pve_sources` | List the configured Proxmox VE sources (name, id, base URL, auth mode, whether the token secret/login password are configured, and which one is the default). Read-only; never returns credentials. |
 | `pve_version` | Get Proxmox VE API version and the enabled features of the datacenter. Read-only. |
 | `pve_cluster_status` | Get cluster status: quorum, node list, and cluster-wide info. Read-only. |
 | `pve_cluster_resources` | Get a cluster-wide index of all resources (nodes, VMs, containers, storage), optionally filtered by type. This is the single best overview call. Read-only. |

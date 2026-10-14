@@ -19,7 +19,7 @@
 
 ## 安装（给 agent 用）
 
-安装后，agent 会自动获得 232 个 `pve_*` tools。
+安装后，agent 会自动获得 233 个 `pve_*` tools。除 `pve_sources` 外，每个工具都接受可选的 `source` 参数。
 
 本地开发：
 
@@ -48,26 +48,39 @@ dsh --profile <name> --patch ./cordis.patch.yml
 
 ## 配置
 
-在 DSH Web：**Settings → Plugins → Proxmox VE control**。
+在 DSH Web：**Settings → Plugins → Proxmox VE**（DeepSeek Harness 0.2.0+ 在设置页左侧提供独立分区）。
 
-| 字段 | 说明 |
-| --- | --- |
-| Base URL | 例如 `https://pve.example.com:8006` |
-| Authentication | `API Token`（PVE 6.0+）或 `Username / password`（兼容 PVE 5.x） |
-| Token ID | `user@realm!tokenid`，例如 `monitor@pve!dsh` — 仅 token 模式 |
-| Token Secret | token UUID；只写不读 — 仅 token 模式 |
-| Username | 例如 `root@pam` — 仅 password 模式 |
-| Password | 登录密码；只写不读 — 仅 password 模式 |
-| Skip TLS verification | 内网自签名证书可开启（5.x 和 6.0+） |
+页面列出你的 Proxmox VE **源站**。每个想让助手访问的集群（例如生产、测试）各添加一个源站。每个源站包含：
 
-PVE 6.0+ → 在 **Datacenter → Permissions → API Token** 创建最小权限 token。PVE 5.x 没有 API token → 切到用户名/密码模式。
+- **源站名称**：必填且唯一，可用任何语言。你（或助手）用它来选择源站。
+- **UID**：自动生成、全球唯一、不可修改。凭证按它存放，所以重命名源站不会丢失密钥。
+- **Base URL**：例如 `https://pve.example.com:8006`。
+- **鉴权方式**：`API Token`（PVE 6.0+）或 `账号密码`（兼容 PVE 5.x），每个源站可独立选择。
+  - Token 模式：**Token ID**（`user@realm!tokenid`，例如 `monitor@pve!dsh`）+ **Token Secret**（只写不读）。
+  - 密码模式：**用户名**（例如 `root@pam`）+ **密码**（只写不读）。
+- **跳过 TLS 校验**：内网自签名证书可开启（5.x 和 6.0+）。
+
+可以把其中一个设为**默认**源站；省略 `source` 的工具调用会使用它。只有一个源站时，它自动就是默认。
+
+PVE 6.0+ → 在 **Datacenter → Permissions → API Token** 为该源站创建最小权限 token。PVE 5.x 没有 API token → 把该源站切到用户名/密码模式。
+
+### 多源站
+
+除 `pve_sources` 外，每个工具都接受可选的 `source` 参数（源站名称或 UID）。你对助手说"看看测试环境的集群"，它会先调用 `pve_sources` 获知有哪些名称，再传入 `source`。如果配置了多个源站但没有默认源站，省略 `source` 会直接报错，而不是猜一个。
+
+写工具的审批提示会点名目标源站，并且审批与它绑定：如果在审批之后、执行之前默认源站发生了变化，写入会被拒绝，而不是落到另一个 Proxmox VE 集群上。
+
+### 从 0.1.x 升级
+
+原有的单源配置会继续可用。首次启动时，插件会把它转成一个名为 `default` 的源站，并**沿用原来已存的 Token Secret / 登录密码**（凭证本身不会被搬运或重新输入）。如果这一步自动迁移没能执行，设置页会显示"检测到旧版单源配置"的提示和**导入为源站**按钮。
 
 ## 工具
 
-232 个 tools（116 个只读 / 116 个写）分布在 13 个 domain。所有写操作都需要原生用户批准。
+233 个 tools（117 个只读 / 116 个写）分布在 14 个 domain。所有写操作都需要原生用户批准。除 `pve_sources` 外，每个工具都接受可选的 `source` 参数。
 
 | 域 | 工具数 | 范围 |
 | --- | --- | --- |
+| 源站 | 1 | 列出已配置的 Proxmox VE 源站（绝不返回凭证） |
 | 集群与总览 | 8 | 版本、状态、资源索引、任务、日志、nextid、options |
 | 节点与任务 | 23 | 状态、配置、服务、磁盘、syslog、apt、SMART、任务轮询 |
 | 网络 | 12 | 网卡 CRUD、重载、DNS、hosts、时间 |

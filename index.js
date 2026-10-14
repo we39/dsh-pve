@@ -6,6 +6,7 @@ import http from "node:http";
 import https from "node:https";
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import Schema from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
@@ -43,8 +44,20 @@ export function unwrapVolatile(value) {
 
 // API Token 的 secret 部分走凭证库（仅写不读）；tokenId / baseUrl / 开关属于非敏感，
 // 走 settings namespace（可回显核对）。
+// 旧版（单源）凭证引用：迁移时沿用，不搬运密钥。
 const SECRET_REF = "PVE_API_TOKEN_SECRET";
 const PASSWORD_REF = "PVE_API_PASSWORD";
+// 多源站：每个源站的 token secret / 登录密码引用由源站 id 派生，改名不影响凭证。
+const SECRET_REF_PREFIX = "PVE_SECRET_";
+const PASSWORD_REF_PREFIX = "PVE_PASSWORD_";
+const DEFAULT_SOURCE_NAME = "default";
+const MAX_SOURCES = 50;
+const MAX_SOURCE_NAME_CHARS = 100;
+// 源站 id：系统生成的 UUID（或退化格式），只含字母数字与连字符。
+const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/;
+// 启动迁移等待宿主把本插件登记为可配置条目的轮询参数（共约 10 秒）。
+const MIGRATION_RETRY_MS = 250;
+const MIGRATION_MAX_ATTEMPTS = 40;
 const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const REQUEST_TIMEOUT_MS = 20_000;
 const TOOL_TIMEOUT_MS = 90_000;
@@ -74,52 +87,133 @@ Async operations return a task ID in the form "UPID:node:...". After any write t
 
 Credentials (the API token secret — or the login password in password mode) are loaded from the local credential store and are NEVER echoed in tool output, approval prompts, or your responses. Never ask the user to paste a token secret or password into chat.
 
+Every tool accepts an optional "source" argument — the name of a configured Proxmox VE source. When the user has more than one Proxmox VE cluster (for example production and staging), call pve_sources first to list the configured source names, then pass the one the user means. Omit "source" to use the default source. Never guess a source name, and never run a write against a source the user did not clearly identify when several are configured.
+
 Prefer listing first: call pve_node_list for node names, pve_cluster_resources (optionally type=vm|ct|storage) for an overview, pve_vm_list/pve_ct_list per node, and pve_storage_list for storage names, before drilling into a specific ID.
 Before an update, call the matching get/config tool first so you only change fields the user asked about.
 
 The PVE API accepts many optional parameters you can pass via the per-tool "options" parameter as a JSON object (e.g. {"pool":"prod","cpulimit":1}). Use it only for parameters the tool does not already expose as its own fields.`;
 
+// 单个源站：id 系统生成、只读、全局唯一；name 必填且唯一（工具按名称选源）；
+// akRef（token secret 引用）/ skRef（登录密码引用）为空时由 id 派生（见
+// secretRefForId / passwordRefForId），迁移来的源站显式沿用旧版引用，因此
+// 已存的凭证无需搬运。两种鉴权模式可以在不同源站上独立选择。
+const SourceConfig = Schema.object({
+  id: Schema.string()
+    .default("")
+    .description("System-generated, read-only, globally unique source UID."),
+  name: Schema.string()
+    .default("")
+    .description(
+      "Required, unique source name (any language); used to select this source in tool calls.",
+    ),
+  baseUrl: Schema.string()
+    .default("")
+    .description("Proxmox VE base URL for this source."),
+  authMode: Schema.string()
+    .default("token")
+    .description(
+      'Authentication mode for this source: "token" (API token, PVE 6.0+) or "password" (username/password ticket auth, works on PVE 5.x).',
+    ),
+  tokenId: Schema.string()
+    .default("")
+    .description(
+      'PVE API token identifier for this source, e.g. user@realm!tokenid. Only used when authMode is "token".',
+    ),
+  akRef: Schema.string()
+    .default("")
+    .description(
+      "Credential reference holding this source's API token secret; derived from id when empty.",
+    ),
+  username: Schema.string()
+    .default("")
+    .description(
+      'PVE username for this source, e.g. root@pam. Only used when authMode is "password".',
+    ),
+  skRef: Schema.string()
+    .default("")
+    .description(
+      "Credential reference holding this source's login password; derived from id when empty.",
+    ),
+  allowInsecureTls: Schema.boolean()
+    .default(false)
+    .description(
+      "Skip TLS certificate verification for this source. Enable for self-signed Proxmox hosts.",
+    ),
+});
+
 export const Config = Schema.object({
+  sources: Schema.array(SourceConfig)
+    .default([])
+    .volatile()
+    .description(
+      "Configured Proxmox VE sources. Each has a unique name, a read-only UID, its own base URL, and its own authentication settings.",
+    ),
+  defaultSource: Schema.string()
+    .default("")
+    .volatile()
+    .description(
+      "Id of the source used when a tool call omits the source argument.",
+    ),
+  // 以下为旧版单源字段：仅供迁移与「尚无 sources」时的隐式默认源使用。
+  legacyMigrated: Schema.boolean()
+    .default(false)
+    .volatile()
+    .description(
+      "Set once the legacy single-source configuration has been materialized into sources[]; prevents a removed source from being resurrected on the next start.",
+    ),
   baseUrl: Schema.string()
     .default("")
     .volatile()
     .description(
-      "Proxmox VE base URL, e.g. https://pve.example.com. When empty, resolve from settings.",
+      "Legacy single-source Proxmox VE base URL. Prefer sources[]; migrated into a default source on startup.",
     ),
   tokenId: Schema.string()
     .default("")
     .volatile()
     .description(
-      'PVE API token identifier, e.g. user@realm!tokenid (the part before the "=" in PVEAPIToken).',
+      'Legacy single-source PVE API token identifier, e.g. user@realm!tokenid (the part before the "=" in PVEAPIToken).',
     ),
   allowInsecureTls: Schema.boolean()
     .default(false)
     .volatile()
     .description(
-      "Skip TLS certificate verification. Enable for self-signed Proxmox hosts.",
+      "Legacy single-source: skip TLS certificate verification. Enable for self-signed Proxmox hosts.",
     ),
   authMode: Schema.string()
     .default("token")
     .volatile()
     .description(
-      'Authentication mode: "token" (API token, PVE 6.0+) or "password" (username/password ticket auth, works on PVE 5.x).',
+      'Legacy single-source authentication mode: "token" (API token, PVE 6.0+) or "password" (username/password ticket auth, works on PVE 5.x).',
     ),
   username: Schema.string()
     .default("")
     .volatile()
     .description(
-      'PVE username for password auth, e.g. root@pam. Only used when authMode is "password".',
+      'Legacy single-source PVE username for password auth, e.g. root@pam. Only used when authMode is "password".',
+    ),
+  akRef: Schema.string()
+    .default(SECRET_REF)
+    .description(
+      "Legacy single-source credential reference containing the PVE API token secret.",
+    ),
+  skRef: Schema.string()
+    .default(PASSWORD_REF)
+    .description(
+      "Legacy single-source credential reference containing the PVE login password.",
     ),
 });
 
 // ---------------------------------------------------------------- helpers
 
-function normalizeBaseUrl(input) {
+function normalizeBaseUrl(input, allowEmpty = false) {
   const value = String(input ?? "").trim();
-  if (!value)
+  if (!value) {
+    if (allowEmpty) return "";
     throw new Error(
       "Proxmox VE base URL is not configured. Set it in Settings → Plugins.",
     );
+  }
   let url;
   try {
     url = new URL(value);
@@ -166,6 +260,12 @@ function textOut(value) {
   return [{ type: "text", text: String(value) }];
 }
 
+function formatFields(fields) {
+  return Object.entries(fields)
+    .map(([key, value]) => `${key}=${JSON.stringify(value ?? "")}`)
+    .join(" ");
+}
+
 // password 模式下：带 ticket 的 Cookie，非 GET 请求再附 CSRF 令牌。
 function ticketHeaders(ticket, csrf, method) {
   const headers = { Cookie: `PVEAuthCookie=${ticket}` };
@@ -210,6 +310,99 @@ function validateCredentialRef(ref, label) {
       `Invalid ${label} credential reference: ${JSON.stringify(ref)}`,
     );
   return ref;
+}
+
+// 源站 id：优先 crypto.randomUUID，退化到 getRandomValues 拼装 v4 UUID，
+// 最后退化到时间+随机串（仍足够唯一）。
+export function generateSourceId() {
+  const c = globalThis.crypto;
+  if (c?.randomUUID) return String(c.randomUUID());
+  if (c?.getRandomValues) {
+    const bytes = c.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (x) => x.toString(16).padStart(2, "0")).join(
+      "",
+    );
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function refForId(prefix, id, label) {
+  const clean = String(id ?? "")
+    .replace(/[^A-Za-z0-9_]/g, "")
+    .slice(0, 64);
+  return validateCredentialRef(`${prefix}${clean}`, label);
+}
+
+// 由源站 id 派生凭证引用：同一 id 恒定映射到同一 ref，改名不影响凭证。
+// 两种鉴权模式各自独立的引用——一个源站只用其中一个，但两个 ref 都会预先派生好，
+// 允许用户在不丢失另一种鉴权方式已存凭证的情况下切换 authMode。
+export function secretRefForId(id) {
+  return refForId(SECRET_REF_PREFIX, id, "API token secret");
+}
+export function passwordRefForId(id) {
+  return refForId(PASSWORD_REF_PREFIX, id, "login password");
+}
+
+// 源站名称：必填、非空、限长；trim 后返回（唯一性由调用方按集合校验）。
+export function normalizeSourceName(input) {
+  const value = String(input ?? "").trim();
+  if (!value)
+    throw new Error("Each Proxmox VE source must have a non-empty name.");
+  if (value.length > MAX_SOURCE_NAME_CHARS)
+    throw new Error(
+      `Proxmox VE source name must not exceed ${MAX_SOURCE_NAME_CHARS} characters.`,
+    );
+  return value;
+}
+
+// 校验整份配置（写入口与启动迁移共用）：每个源站形状可识别、名称唯一、
+// 引用合法、authMode 取值合法；defaultSource 要么为空要么命中某个源站。
+function validateConfigValue(raw) {
+  const value = unwrapVolatile(raw) ?? {};
+  validateCredentialRef(value.akRef ?? SECRET_REF, "API token secret");
+  validateCredentialRef(value.skRef ?? PASSWORD_REF, "login password");
+  if (value.authMode && !["token", "password"].includes(value.authMode)) {
+    throw new Error('authMode must be "token" or "password".');
+  }
+  const sources = Array.isArray(value.sources) ? value.sources : [];
+  if (sources.length > MAX_SOURCES)
+    throw new Error(
+      `At most ${MAX_SOURCES} Proxmox VE sources can be configured.`,
+    );
+  const names = new Set();
+  const ids = new Set();
+  for (const source of sources) {
+    const id = typeof source?.id === "string" ? source.id.trim() : "";
+    if (!SOURCE_ID_PATTERN.test(id))
+      throw new Error(
+        `Invalid Proxmox VE source id: ${JSON.stringify(source?.id)}`,
+      );
+    if (ids.has(id)) throw new Error(`Duplicate Proxmox VE source id: ${id}`);
+    ids.add(id);
+    const sourceName = normalizeSourceName(source?.name);
+    if (names.has(sourceName))
+      throw new Error(
+        `Duplicate Proxmox VE source name: ${JSON.stringify(sourceName)}`,
+      );
+    names.add(sourceName);
+    if (source.authMode && !["token", "password"].includes(source.authMode)) {
+      throw new Error(
+        `Source ${JSON.stringify(sourceName)}: authMode must be "token" or "password".`,
+      );
+    }
+    if (source.akRef) validateCredentialRef(source.akRef, "API token secret");
+    if (source.skRef) validateCredentialRef(source.skRef, "login password");
+    if (source.baseUrl) normalizeBaseUrl(source.baseUrl, true);
+  }
+  const def =
+    typeof value.defaultSource === "string" ? value.defaultSource : "";
+  if (def && !ids.has(def))
+    throw new Error(
+      `defaultSource ${JSON.stringify(def)} does not match any configured Proxmox VE source.`,
+    );
 }
 
 function collectBody(response) {
@@ -2248,24 +2441,34 @@ function formatResult(data, def) {
   return JSON.stringify(cleaned, null, 2);
 }
 
-function buildTool(def, api) {
-  return defineTool({
-    name: def.name,
-    description: def.description,
-    parameters: def.params,
-    output: {
-      schema: { type: "string" },
-      render: (_args, value) => textOut(value),
+// 每个工具共用的可选 source 参数：按源站名称（或 id）选择目标 Proxmox VE。
+const SOURCE_PARAM = {
+  type: "string",
+  description:
+    "Optional Proxmox VE source name (call pve_sources to list configured sources); omit to use the default source.",
+};
+
+function buildTool(def, api, defineSourceTool) {
+  return defineSourceTool(
+    {
+      name: def.name,
+      description: def.description,
+      parameters: def.params,
+      output: {
+        schema: { type: "string" },
+        render: (_args, value) => textOut(value),
+      },
+      timeoutMs: TOOL_TIMEOUT_MS,
+      async execute(args, exec) {
+        const { path, params } = resolveArgs(def, args ?? {});
+        const data = await api(def.method, path, params, {
+          parentSignal: exec.signal,
+        });
+        return formatResult(data, def);
+      },
     },
-    timeoutMs: TOOL_TIMEOUT_MS,
-    async execute(args, exec) {
-      const { path, params } = resolveArgs(def, args ?? {});
-      const data = await api(def.method, path, params, {
-        parentSignal: exec.signal,
-      });
-      return formatResult(data, def);
-    },
-  });
+    { write: def.write === true },
+  );
 }
 
 function approvalReasonForWrite(exec) {
@@ -2300,21 +2503,20 @@ function approvalReasonForWrite(exec) {
 
 export function apply(ctx, config = {}) {
   const entryConfig = unwrapVolatile({
+    sources: [],
+    defaultSource: "",
+    legacyMigrated: false,
     baseUrl: "",
     tokenId: "",
     allowInsecureTls: false,
     authMode: "token",
     username: "",
+    akRef: SECRET_REF,
+    skRef: PASSWORD_REF,
     ...config,
   });
-  validateCredentialRef(SECRET_REF, "PVE_API_TOKEN_SECRET");
-  validateCredentialRef(PASSWORD_REF, "PVE_API_PASSWORD");
-
-  const validateConfigValue = (value) => {
-    if (value.authMode && !["token", "password"].includes(value.authMode)) {
-      throw new Error('authMode must be "token" or "password".');
-    }
-  };
+  validateCredentialRef(entryConfig.akRef, "API token secret");
+  validateCredentialRef(entryConfig.skRef, "login password");
 
   // 当前生效配置：settings 服务可用时以其解析值为准，否则回退为入口配置。
   // 0.1.7+ 宿主的 settings 服务不再提供 register/scope，只有 describe/update/mutate，
@@ -2345,56 +2547,328 @@ export function apply(ctx, config = {}) {
             ? { ...entryConfig, ...descriptor.value }
             : entryConfig),
       );
+    const updateConfig = (patch, descriptor) => {
+      validateConfigValue({ ...currentConfig(descriptor), ...patch });
+      const revision = Number.isInteger(descriptor?.revision)
+        ? descriptor.revision
+        : undefined;
+      if (typeof settings.update === "function")
+        return settings.update(SETTINGS_NAMESPACE, patch, revision);
+      if (typeof scope?.update === "function") return scope.update(patch);
+      throw new Error("Settings service does not support update.");
+    };
     activeConfig = () => currentConfig();
     sctx.effect(() => () => {
       activeConfig = () => entryConfig;
     });
+
+    // 启动迁移：sources 为空且存在旧版单源配置（URL 或凭证）时，物化出一个
+    // 默认源站，让既有配置在设置页可见可编辑。凭证沿用旧版 ref，不搬运密钥。
+    // 带 revision 写入：期间若用户已在设置页保存了自己的源站，写入会被宿主以
+    // 版本冲突拒绝并放弃本次迁移，用户刚写的配置得以保留。
+    // 宿主的 settings.describe() 只返回已进入运行态的条目；本回调在 apply 同步阶段
+    // 触发，此时本插件的描述符可能还不存在（写入也会因此报 "no longer
+    // configurable"）。所以迁移要等描述符出现再做：有限次重试、不阻塞启动，
+    // 插件卸载后立即停止。旧宿主（有 register/scope）不依赖描述符，直接继续。
+    let disposed = false;
+    sctx.effect(() => () => {
+      disposed = true;
+    });
+    const waitForDescriptor = async () => {
+      if (scope) return undefined;
+      for (let attempt = 0; attempt < MIGRATION_MAX_ATTEMPTS; attempt += 1) {
+        if (disposed) return null;
+        const descriptor = descriptorOf();
+        if (descriptor) return descriptor;
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, MIGRATION_RETRY_MS);
+          timer.unref?.();
+        });
+      }
+      return null;
+    };
+    (async () => {
+      try {
+        const descriptor = await waitForDescriptor();
+        if (descriptor === null) {
+          return;
+        }
+        const current = currentConfig(descriptor);
+        if (current.legacyMigrated === true) {
+          return;
+        }
+        if (Array.isArray(current.sources) && current.sources.length > 0) {
+          return;
+        }
+        const akRef = String(current.akRef || "").trim() || SECRET_REF;
+        const skRef = String(current.skRef || "").trim() || PASSWORD_REF;
+        const legacyUrl = String(current.baseUrl ?? "").trim();
+        const [ak, sk] = await Promise.all([
+          ctx.credentials.resolve(akRef),
+          ctx.credentials.resolve(skRef),
+        ]);
+        if (!legacyUrl && !ak?.value && !sk?.value) {
+          return;
+        }
+        const id = generateSourceId();
+        await updateConfig(
+          {
+            sources: [
+              {
+                id,
+                name: DEFAULT_SOURCE_NAME,
+                baseUrl: legacyUrl,
+                authMode: current.authMode === "password" ? "password" : "token",
+                tokenId: String(current.tokenId ?? ""),
+                akRef,
+                username: String(current.username ?? ""),
+                skRef,
+                allowInsecureTls: current.allowInsecureTls === true,
+              },
+            ],
+            defaultSource: id,
+            // 旧 URL 已进入 sources[]；清空它并打上标记，之后即使用户移除了这个
+            // 源站，重启也不会再把它迁移回来。
+            baseUrl: "",
+            legacyMigrated: true,
+          },
+          descriptor,
+        );
+        console.error("[pve-migrate] sources materialized sources=1");
+      } catch (error) {
+        console.error(
+          `[pve-migrate] sources failed reason=${/conflict|revision|changed since/i.test(String(error?.message ?? error)) ? "revision-conflict" : "settings-error"}`,
+        );
+      }
+    })();
   });
 
   ctx.systemPrompt.section({ name: "tool:pve", order: 109, text: GUIDANCE });
 
-  async function resolveBaseUrl() {
-    return normalizeBaseUrl(activeConfig().baseUrl);
+  // ── 多源站解析 ──────────────────────────────────────────────────────
+
+  // 当前工具调用所绑定的源站，经 AsyncLocalStorage 传给 api()：所有工具都不用
+  // 逐个改签名，也不会在并发调用之间串号。
+  const sourceStore = new AsyncLocalStorage();
+  // 审批绑定：宿主对同一次调用复用同一个 exec 对象（pre-execute → execute），
+  // 故按 exec 记录审批时解析出的源站；执行时若解析结果与之不符就拒绝写入，
+  // 而不是把用户批准过的写入发到另一台 Proxmox VE。只存非敏感的源站标识。
+  const approvalBindings = new WeakMap();
+  // password 模式的 ticket 是有状态的会话凭证，必须按源站隔离缓存——
+  // 不能像单源版本那样用一个全局变量，否则并发多源请求会互相顶替 ticket。
+  const ticketStates = new Map(); // sourceKey -> { ticket, csrf, expiresAt }
+
+  // 生效源站列表：配置里的 sources 非空时以其为准（逐项补齐派生凭证引用）；
+  // 否则用旧版单源字段合成一个隐式默认源站（id=null 标记 legacy）。
+  function effectiveSources() {
+    const cfg = activeConfig();
+    const raw = Array.isArray(cfg.sources) ? cfg.sources : [];
+    const list = [];
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object") continue;
+      const id = typeof entry.id === "string" ? entry.id.trim() : "";
+      const sourceName =
+        typeof entry.name === "string" ? entry.name.trim() : "";
+      if (!id || !sourceName) continue;
+      list.push({
+        id,
+        name: sourceName,
+        baseUrl: typeof entry.baseUrl === "string" ? entry.baseUrl : "",
+        authMode: entry.authMode === "password" ? "password" : "token",
+        tokenId: typeof entry.tokenId === "string" ? entry.tokenId : "",
+        akRef: entry.akRef || secretRefForId(id),
+        username: typeof entry.username === "string" ? entry.username : "",
+        skRef: entry.skRef || passwordRefForId(id),
+        allowInsecureTls: entry.allowInsecureTls === true,
+        legacy: false,
+      });
+    }
+    if (list.length > 0) return list;
+    // 旧配置已迁移进 sources[] 后，用户把源站全部移除就是「没有源站」，
+    // 不能再回退成隐式的旧版源站。
+    if (cfg.legacyMigrated === true) return [];
+    return [
+      {
+        id: null,
+        name: DEFAULT_SOURCE_NAME,
+        baseUrl: typeof cfg.baseUrl === "string" ? cfg.baseUrl : "",
+        authMode: cfg.authMode === "password" ? "password" : "token",
+        tokenId: typeof cfg.tokenId === "string" ? cfg.tokenId : "",
+        akRef: cfg.akRef || SECRET_REF,
+        username: typeof cfg.username === "string" ? cfg.username : "",
+        skRef: cfg.skRef || PASSWORD_REF,
+        allowInsecureTls: cfg.allowInsecureTls === true,
+        legacy: true,
+      },
+    ];
   }
 
-  // password 模式下的 ticket 缓存（PVE ticket 默认 2 小时有效）。
-  let ticketState = null; // { ticket, csrf, expiresAt }
-
-  async function authenticate(method) {
+  // 生效默认源站 id：显式 defaultSource 命中优先，否则唯一源站即默认。
+  function defaultSourceId(sources) {
     const cfg = activeConfig();
-    if ((cfg.authMode ?? "token") === "password") {
-      const t = await ensureTicket();
+    if (
+      typeof cfg.defaultSource === "string" &&
+      cfg.defaultSource &&
+      sources.some((s) => s.id === cfg.defaultSource)
+    )
+      return cfg.defaultSource;
+    return sources.length === 1 ? sources[0].id : null;
+  }
+
+  // 按名称（首选）或 id 解析源站；省略时用默认源站。无法确定则抛错并列出可选名称。
+  function resolveSource(sourceArg) {
+    const sources = effectiveSources();
+    const key = String(sourceArg ?? "").trim();
+    const names = sources.map((s) => JSON.stringify(s.name)).join(", ");
+    if (sources.length === 0)
+      throw new Error(
+        "No Proxmox VE source is configured. Add one in Settings → Plugins.",
+      );
+    if (key) {
+      const found =
+        sources.find((s) => s.name === key) ?? sources.find((s) => s.id === key);
+      if (found) return found;
+      throw new Error(
+        `Unknown Proxmox VE source ${JSON.stringify(key)}. Configured sources: ${names || "(none)"}. Call pve_sources to list them.`,
+      );
+    }
+    const defaultId = defaultSourceId(sources);
+    const def = sources.find((s) => s.id === defaultId);
+    if (def) return def;
+    throw new Error(
+      `Multiple Proxmox VE sources are configured (${names}) but none is the default and no source was specified. Pass the source name, or set a default in Settings → Plugins.`,
+    );
+  }
+
+  // 源站身份：id + 地址 + 鉴权设置 + 凭证引用。任何一项变了就是另一台（或另一个
+  // 身份）。只含非敏感字段：URL、模式与凭证 ref 名，绝不含密钥/密码明文。
+  function sourceIdentity(src) {
+    return [
+      src?.id ?? "legacy",
+      String(src?.baseUrl ?? ""),
+      String(src?.authMode ?? "token"),
+      String(src?.tokenId ?? ""),
+      String(src?.akRef ?? ""),
+      String(src?.username ?? ""),
+      String(src?.skRef ?? ""),
+    ].join("\u0000");
+  }
+
+  // ticket 缓存的键：源站身份本身（含鉴权设置），身份一变就必须重新登录。
+  function ticketKey(src) {
+    return sourceIdentity(src);
+  }
+
+  // 记住审批时解析出的源站。非对象（测试直接构造的空壳）时跳过绑定。
+  function bindApproval(exec, src) {
+    if (!exec || typeof exec !== "object" || !src) return;
+    approvalBindings.set(exec, {
+      identity: sourceIdentity(src),
+      name: src.name,
+    });
+  }
+
+  // 写操作的源站解析：审批后到执行前默认源站可能被改掉（另一个设置页、另一次
+  // 配置更新）。此时拒绝写入——用户批准的是审批文案里那一台，不是执行时随手
+  // 解析到的那一台。
+  function resolveApprovedSource(sourceArg, exec) {
+    const resolved = resolveSource(sourceArg);
+    const bound =
+      exec && typeof exec === "object" ? approvalBindings.get(exec) : null;
+    if (!bound) return resolved;
+    if (bound.identity !== sourceIdentity(resolved))
+      throw new Error(
+        `The Proxmox VE source this write was approved for has changed: approval named ${JSON.stringify(bound.name)}, the call now resolves to ${JSON.stringify(resolved.name)}. Nothing was written — run the tool again so the approval matches the source it will actually write to.`,
+      );
+    return resolved;
+  }
+
+  // 供 pve_sources 工具列出：附带鉴权凭证是否已配（只读布尔，绝不回显明文）。
+  async function listSources() {
+    const sources = effectiveSources();
+    const defaultId = defaultSourceId(sources);
+    const configured = async (ref) => {
+      try {
+        return Boolean((await ctx.credentials.resolve(ref))?.value);
+      } catch {
+        return false;
+      }
+    };
+    return Promise.all(
+      sources.map(async (source) => ({
+        id: source.id,
+        name: source.name,
+        baseUrl: source.baseUrl,
+        authMode: source.authMode,
+        tokenConfigured: Boolean(String(source.tokenId ?? "").trim()),
+        secretConfigured: await configured(source.akRef),
+        usernameConfigured: Boolean(String(source.username ?? "").trim()),
+        passwordConfigured: await configured(source.skRef),
+        isDefault: source.id === defaultId,
+      })),
+    );
+  }
+
+  // 工具级入口：给任意 defineTool 选项统一追加可选 source 参数，并在 execute 外
+  // 解析出源站、经 AsyncLocalStorage 交给 api()。写工具走审批绑定校验。
+  function defineSourceTool(options, { write = false } = {}) {
+    return defineTool({
+      ...options,
+      parameters: { ...options.parameters, source: SOURCE_PARAM },
+      execute(args, exec) {
+        const src = write
+          ? resolveApprovedSource(args?.source, exec)
+          : resolveSource(args?.source);
+        return sourceStore.run({ source: src }, () => options.execute(args, exec));
+      },
+    });
+  }
+
+  function currentSource() {
+    return sourceStore.getStore()?.source ?? resolveSource();
+  }
+
+  async function resolveBaseUrl(src = currentSource()) {
+    return normalizeBaseUrl(src.baseUrl);
+  }
+
+  async function authenticate(method, src = currentSource()) {
+    if ((src.authMode ?? "token") === "password") {
+      const t = await ensureTicket(src);
       return ticketHeaders(t.ticket, t.csrf, method);
     }
-    const tok = String(cfg.tokenId ?? "").trim();
+    const tok = String(src.tokenId ?? "").trim();
+    const where = src.legacy ? "" : ` for source ${JSON.stringify(src.name)}`;
     if (!tok)
       throw new Error(
-        "PVE API token id is not configured. Set it in Settings → Plugins (user@realm!tokenid).",
+        `PVE API token id is not configured${where}. Set it in Settings → ${src.legacy ? "Plugins" : "Plugins → Proxmox VE"} (user@realm!tokenid).`,
       );
-    const secret = await ctx.credentials.resolve(SECRET_REF);
+    const secret = await ctx.credentials.resolve(src.akRef);
     if (!secret?.value)
       throw new Error(
-        `Credential ${SECRET_REF} (API token secret) is not configured. Set it in Settings → Plugins.`,
+        `Credential ${src.akRef} (API token secret) is not configured${where}. Set it in Settings → Plugins.`,
       );
     return { Authorization: `PVEAPIToken ${tok}=${secret.value}` };
   }
 
-  async function ensureTicket() {
+  async function ensureTicket(src = currentSource()) {
+    const key = ticketKey(src);
     const now = Date.now();
-    if (ticketState && ticketState.expiresAt > now + 60_000) return ticketState;
-    const cfg = activeConfig();
-    const username = String(cfg.username ?? "").trim();
+    const existing = ticketStates.get(key);
+    if (existing && existing.expiresAt > now + 60_000) return existing;
+    const username = String(src.username ?? "").trim();
+    const where = src.legacy ? "" : ` for source ${JSON.stringify(src.name)}`;
     if (!username)
       throw new Error(
-        'PVE username is not configured. Set it in Settings → Plugins (e.g. root@pam), with authMode "password".',
+        `PVE username is not configured${where}. Set it in Settings → ${src.legacy ? "Plugins" : "Plugins → Proxmox VE"} (e.g. root@pam), with authMode "password".`,
       );
-    const pw = await ctx.credentials.resolve(PASSWORD_REF);
+    const pw = await ctx.credentials.resolve(src.skRef);
     if (!pw?.value)
       throw new Error(
-        `Credential ${PASSWORD_REF} (PVE login password) is not configured. Set it in Settings → Plugins.`,
+        `Credential ${src.skRef} (PVE login password) is not configured${where}. Set it in Settings → Plugins.`,
       );
-    const baseUrl = await resolveBaseUrl();
-    const { allowInsecureTls } = cfg;
+    const baseUrl = await resolveBaseUrl(src);
+    const { allowInsecureTls } = src;
     const body = new URLSearchParams({
       username,
       password: pw.value,
@@ -2411,30 +2885,32 @@ export function apply(ctx, config = {}) {
     });
     if (res.status < 200 || res.status >= 300) {
       throw new Error(
-        `PVE login failed (${res.status}): ${errorDetail(res.text)}`,
+        `PVE login failed (${res.status})${where}: ${errorDetail(res.text)}`,
       );
     }
     let parsed;
     try {
       parsed = JSON.parse(res.text);
     } catch {
-      throw new Error("PVE login returned an invalid JSON response.");
+      throw new Error(`PVE login returned an invalid JSON response${where}.`);
     }
     const data = parsed?.data;
     if (!data?.ticket) {
-      throw new Error("PVE login response did not include a ticket.");
+      throw new Error(`PVE login response did not include a ticket${where}.`);
     }
-    ticketState = {
+    const state = {
       ticket: data.ticket,
       csrf: data.CSRFPreventionToken ?? "",
       expiresAt: now + 110 * 60_000,
     };
-    return ticketState;
+    ticketStates.set(key, state);
+    return state;
   }
 
   async function api(method, path, params = {}, { parentSignal } = {}) {
-    const baseUrl = await resolveBaseUrl();
-    const { allowInsecureTls } = activeConfig();
+    const src = currentSource();
+    const baseUrl = await resolveBaseUrl(src);
+    const { allowInsecureTls } = src;
     let url;
     try {
       url = new URL(apiUrl(baseUrl, path));
@@ -2452,7 +2928,7 @@ export function apply(ctx, config = {}) {
       body = sp.toString();
     }
 
-    const isPassword = (activeConfig().authMode ?? "token") === "password";
+    const isPassword = (src.authMode ?? "token") === "password";
     // 仅 GET 允许网络级重试；非 GET 在 5xx/网络错误时直接失败，避免重复执行写操作。
     let remaining = method === "GET" ? 2 : 1;
     let reauthorized = false;
@@ -2460,7 +2936,7 @@ export function apply(ctx, config = {}) {
     for (;;) {
       const headers = {
         Accept: "application/json",
-        ...(await authenticate(method)),
+        ...(await authenticate(method, src)),
       };
       if (body !== undefined)
         headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -2506,7 +2982,7 @@ export function apply(ctx, config = {}) {
 
       // password 模式下 401 表示 ticket 过期：清缓存、重新登录后重试一次（安全，请求已服务端拒绝）。
       if (res.status === 401 && isPassword && !reauthorized) {
-        ticketState = null;
+        ticketStates.delete(ticketKey(src));
         reauthorized = true;
         continue;
       }
@@ -2527,139 +3003,204 @@ export function apply(ctx, config = {}) {
     const def = BY_NAME.get(exec.name);
     if (def?.write !== true && !SPECIAL_WRITE_NAMES.has(exec.name))
       return decision;
-    return { kind: "ask", reason: approvalReasonForWrite(exec) };
+
+    // 审批文案必须落到具体的源站上：解析不出源站就直接拒绝，而不是让用户批准
+    // 一个执行时必然失败（或指向别处）的写入。
+    let src;
+    try {
+      src = resolveSource(exec.arguments?.source);
+    } catch (error) {
+      return { kind: "deny", reason: String(error?.message ?? error) };
+    }
+    bindApproval(exec, src);
+
+    const reason = approvalReasonForWrite(exec);
+    // 多源站时在审批文案里点名目标源站，用户批准的就是这一台。
+    return {
+      kind: "ask",
+      reason:
+        effectiveSources().length > 1
+          ? `Proxmox VE 源站「${src.name}」：${reason}`
+          : reason,
+    };
   });
 
-  for (const entry of CATALOG) {
-    ctx.tools.register(buildTool(entry, api));
-  }
-
-  // ---- 特殊：节点上执行命令（commands 是 JSON 数组，非逗号连接）----
+  // 列出已配置的源站：供模型在按名称选源前发现可用源站名。只读、无审批，
+  // 绝不回显 Token Secret/密码，只给「是否已配置」的布尔。
   ctx.tools.register(
     defineTool({
-      name: "pve_node_execute",
+      name: "pve_sources",
       description:
-        "Execute one or more commands on a node via the PVE API (requires root). Each command is an array of argv. WRITE OPERATION: triggers a mandatory approval prompt. HIGH RISK — arbitrary command execution on the hypervisor itself.",
-      parameters: {
-        ...NODE,
-        commands: {
-          type: "array",
-          items: { type: "array", items: { type: "string" } },
-          required: true,
-          description:
-            'An array of commands, each an array of argv, e.g. [["ls","-la"],["pveversion"]].',
-        },
-      },
+        'List the configured Proxmox VE sources (name, id, base URL, auth mode, whether the token secret/login password are configured, and which one is the default). Call this before passing a "source" argument to any other pve_* tool. Read-only; never returns credentials.',
+      parameters: {},
       output: {
         schema: { type: "string" },
         render: (_args, value) => textOut(value),
       },
       timeoutMs: TOOL_TIMEOUT_MS,
-      async execute(args, exec) {
-        const commands = args.commands;
-        if (
-          !Array.isArray(commands) ||
-          commands.length === 0 ||
-          !commands.every((c) => Array.isArray(c))
-        ) {
-          throw new Error(
-            "commands must be a non-empty array of command arrays (argv).",
-          );
-        }
-        const node = String(args.node ?? "").trim();
-        if (!node) throw new Error("node is required.");
-        const data = await api(
-          "POST",
-          `/nodes/${encodeURIComponent(node)}/execute`,
-          { commands: JSON.stringify(commands) },
-          { parentSignal: exec.signal },
-        );
-        return formatResult(data, { write: true });
+      async execute() {
+        const sources = await listSources();
+        if (sources.length === 0) return "(no Proxmox VE sources configured)";
+        return sources
+          .map((s) => {
+            const fields = {
+              name: s.name,
+              id: s.id ?? "(legacy single-source config)",
+              baseUrl: s.baseUrl || "(not configured)",
+              authMode: s.authMode,
+              default: s.isDefault,
+            };
+            if (s.authMode === "password") {
+              fields.usernameConfigured = s.usernameConfigured;
+              fields.passwordConfigured = s.passwordConfigured;
+            } else {
+              fields.tokenConfigured = s.tokenConfigured;
+              fields.secretConfigured = s.secretConfigured;
+            }
+            return formatFields(fields);
+          })
+          .join("\n");
       },
     }),
   );
 
+  for (const entry of CATALOG) {
+    ctx.tools.register(buildTool(entry, api, defineSourceTool));
+  }
+
+  // ---- 特殊：节点上执行命令（commands 是 JSON 数组，非逗号连接）----
+  ctx.tools.register(
+    defineSourceTool(
+      {
+        name: "pve_node_execute",
+        description:
+          "Execute one or more commands on a node via the PVE API (requires root). Each command is an array of argv. WRITE OPERATION: triggers a mandatory approval prompt. HIGH RISK — arbitrary command execution on the hypervisor itself.",
+        parameters: {
+          ...NODE,
+          commands: {
+            type: "array",
+            items: { type: "array", items: { type: "string" } },
+            required: true,
+            description:
+              'An array of commands, each an array of argv, e.g. [["ls","-la"],["pveversion"]].',
+          },
+        },
+        output: {
+          schema: { type: "string" },
+          render: (_args, value) => textOut(value),
+        },
+        timeoutMs: TOOL_TIMEOUT_MS,
+        async execute(args, exec) {
+          const commands = args.commands;
+          if (
+            !Array.isArray(commands) ||
+            commands.length === 0 ||
+            !commands.every((c) => Array.isArray(c))
+          ) {
+            throw new Error(
+              "commands must be a non-empty array of command arrays (argv).",
+            );
+          }
+          const node = String(args.node ?? "").trim();
+          if (!node) throw new Error("node is required.");
+          const data = await api(
+            "POST",
+            `/nodes/${encodeURIComponent(node)}/execute`,
+            { commands: JSON.stringify(commands) },
+            { parentSignal: exec.signal },
+          );
+          return formatResult(data, { write: true });
+        },
+      },
+      { write: true },
+    ),
+  );
+
   // ---- 特殊：上传模板 / ISO（multipart）----
   ctx.tools.register(
-    defineTool({
-      name: "pve_storage_upload",
-      description:
-        "Upload a local file (e.g. an ISO or a container template) to a storage. Reads the file on this machine and uploads it. WRITE OPERATION: triggers a mandatory approval prompt.",
-      parameters: {
-        ...NODE,
-        ...STORAGE,
-        filename: {
-          type: "string",
-          required: true,
-          description:
-            'Destination file name on the storage, e.g. "debian-12.iso".',
-        },
-        content: {
-          type: "string",
-          required: true,
-          description: "Local filesystem path of the file to upload.",
-        },
-        contentType: {
-          type: "string",
-          description: "MIME type override (usually auto-detected).",
-        },
-      },
-      output: {
-        schema: { type: "string" },
-        render: (_args, value) => textOut(value),
-      },
-      timeoutMs: TOOL_TIMEOUT_MS,
-      async execute(args, exec) {
-        const node = String(args.node ?? "").trim();
-        if (!node) throw new Error("node is required.");
-        const storage = String(args.storage ?? "").trim();
-        if (!storage) throw new Error("storage is required.");
-        const filename = basename(String(args.filename ?? "").trim());
-        if (!filename) throw new Error("filename is required.");
-        const localPath = String(args.content ?? "").trim();
-        if (!localPath)
-          throw new Error("content (local file path) is required.");
-        const file = await readFile(localPath);
-        const boundary = `----pve${Date.now().toString(16)}`;
-        const headerParts = Buffer.from(
-          [
-            `--${boundary}\r\n`,
-            `Content-Disposition: form-data; name="filename"\r\n\r\n`,
-            `${filename}\r\n`,
-            `--${boundary}\r\n`,
-            `Content-Disposition: form-data; name="content"; filename="${filename}"\r\n`,
-            "Content-Type: application/octet-stream\r\n\r\n",
-          ].join(""),
-        );
-        const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
-        const body = Buffer.concat([headerParts, file, footer]);
-        const baseUrl = await resolveBaseUrl();
-        const { allowInsecureTls } = activeConfig();
-        const authHeaders = await authenticate("POST");
-        const url = apiUrl(
-          baseUrl,
-          `/nodes/${encodeURIComponent(node)}/storage/${encodeURIComponent(storage)}/upload`,
-        );
-        const res = await rawRequest({
-          url,
-          method: "POST",
-          headers: {
-            Accept: "application/json",
-            ...authHeaders,
-            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+    defineSourceTool(
+      {
+        name: "pve_storage_upload",
+        description:
+          "Upload a local file (e.g. an ISO or a container template) to a storage. Reads the file on this machine and uploads it. WRITE OPERATION: triggers a mandatory approval prompt.",
+        parameters: {
+          ...NODE,
+          ...STORAGE,
+          filename: {
+            type: "string",
+            required: true,
+            description:
+              'Destination file name on the storage, e.g. "debian-12.iso".',
           },
-          body,
-          rejectUnauthorized: !allowInsecureTls,
-          signal: exec.signal,
-        });
-        if (res.status < 200 || res.status >= 300) {
-          throw new Error(
-            `Proxmox VE upload failed: ${res.status}: ${errorDetail(res.text)}`,
+          content: {
+            type: "string",
+            required: true,
+            description: "Local filesystem path of the file to upload.",
+          },
+          contentType: {
+            type: "string",
+            description: "MIME type override (usually auto-detected).",
+          },
+        },
+        output: {
+          schema: { type: "string" },
+          render: (_args, value) => textOut(value),
+        },
+        timeoutMs: TOOL_TIMEOUT_MS,
+        async execute(args, exec) {
+          const node = String(args.node ?? "").trim();
+          if (!node) throw new Error("node is required.");
+          const storage = String(args.storage ?? "").trim();
+          if (!storage) throw new Error("storage is required.");
+          const filename = basename(String(args.filename ?? "").trim());
+          if (!filename) throw new Error("filename is required.");
+          const localPath = String(args.content ?? "").trim();
+          if (!localPath)
+            throw new Error("content (local file path) is required.");
+          const file = await readFile(localPath);
+          const boundary = `----pve${Date.now().toString(16)}`;
+          const headerParts = Buffer.from(
+            [
+              `--${boundary}\r\n`,
+              `Content-Disposition: form-data; name="filename"\r\n\r\n`,
+              `${filename}\r\n`,
+              `--${boundary}\r\n`,
+              `Content-Disposition: form-data; name="content"; filename="${filename}"\r\n`,
+              "Content-Type: application/octet-stream\r\n\r\n",
+            ].join(""),
           );
-        }
-        return `Upload task: ${res.text}`;
+          const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+          const body = Buffer.concat([headerParts, file, footer]);
+          const src = currentSource();
+          const baseUrl = await resolveBaseUrl(src);
+          const { allowInsecureTls } = src;
+          const authHeaders = await authenticate("POST", src);
+          const url = apiUrl(
+            baseUrl,
+            `/nodes/${encodeURIComponent(node)}/storage/${encodeURIComponent(storage)}/upload`,
+          );
+          const res = await rawRequest({
+            url,
+            method: "POST",
+            headers: {
+              Accept: "application/json",
+              ...authHeaders,
+              "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            },
+            body,
+            rejectUnauthorized: !allowInsecureTls,
+            signal: exec.signal,
+          });
+          if (res.status < 200 || res.status >= 300) {
+            throw new Error(
+              `Proxmox VE upload failed: ${res.status}: ${errorDetail(res.text)}`,
+            );
+          }
+          return `Upload task: ${res.text}`;
+        },
       },
-    }),
+      { write: true },
+    ),
   );
 }
 
@@ -2678,6 +3219,14 @@ export const internals = Object.freeze({
   SETTINGS_NAMESPACE,
   SECRET_REF,
   PASSWORD_REF,
+  SECRET_REF_PREFIX,
+  PASSWORD_REF_PREFIX,
+  DEFAULT_SOURCE_NAME,
+  generateSourceId,
+  secretRefForId,
+  passwordRefForId,
+  normalizeSourceName,
+  validateConfigValue,
   ticketHeaders,
   apiUrl,
   CATALOG,
