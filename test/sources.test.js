@@ -605,3 +605,122 @@ test("config validation rejects duplicate names, duplicate ids, bad refs, bad au
     /At most 50/,
   );
 });
+
+// ── 路由参数 source 不得泄漏进发给 PVE 的请求 ───────────────────────────
+//
+// 回归：source 曾被当作 PVE 参数拼进 query（GET /version?source=...），PVE 的参数
+// 校验以 "source: property is not defined in schema" 返回 400，导致只要显式传
+// source（哪怕是默认源的名字）所有调用都失败。此前的路由测试只断言了 authorization
+// 头和调用次数，从未检查实际发出的 query，所以一直漏网。
+
+function queryOf(call) {
+  return new URL(call.url, "http://x").searchParams;
+}
+
+test("regression: an explicit source is routing only — it never reaches PVE as a query parameter", async () => {
+  const serverA = await startServer();
+  const serverB = await startServer();
+  try {
+    const host = createHost({
+      value: twoTokenSources(serverA.baseUrl, serverB.baseUrl),
+      creds: { AK_PROD: "secret-prod", AK_STG: "secret-stg" },
+    });
+    apply(host.ctx, {});
+    const version = toolByName(host.tools, "pve_version");
+    // 显式传默认源的名字、非默认源的名字、以及用 id 选择，三种都必须干净。
+    await version.execute({ source: "prod" }, execution());
+    await version.execute({ source: "staging" }, execution());
+    await version.execute({ source: "id-stg" }, execution());
+    for (const call of [...serverA.calls, ...serverB.calls]) {
+      assert.equal(call.url, "/api2/json/version", `source leaked into the PVE request: ${call.url}`);
+    }
+    assert.equal(serverA.calls.length, 1);
+    assert.equal(serverB.calls.length, 2);
+  } finally {
+    await serverA.close();
+    await serverB.close();
+  }
+});
+
+test("regression: real PVE parameters survive while source is dropped (path params and query params)", async () => {
+  const server = await startServer();
+  try {
+    const host = createHost({
+      value: twoTokenSources(server.baseUrl, server.baseUrl),
+      creds: { AK_PROD: "x", AK_STG: "x" },
+    });
+    apply(host.ctx, {});
+    await toolByName(host.tools, "pve_cluster_resources").execute({ type: "vm", source: "staging" }, execution());
+    await toolByName(host.tools, "pve_vm_list").execute({ node: "pve1", source: "prod" }, execution());
+    const [resources, vmList] = server.calls;
+    assert.equal(resources.url, "/api2/json/cluster/resources?type=vm");
+    assert.equal(vmList.url, "/api2/json/nodes/pve1/qemu");
+  } finally {
+    await server.close();
+  }
+});
+
+test("regression: concurrent source-addressed calls (the reported pve_version / cluster_status / node_list trio) all stay clean", async () => {
+  const server = await startServer();
+  try {
+    const host = createHost({
+      value: twoTokenSources(server.baseUrl, server.baseUrl),
+      creds: { AK_PROD: "x", AK_STG: "x" },
+    });
+    apply(host.ctx, {});
+    await Promise.all([
+      toolByName(host.tools, "pve_version").execute({ source: "prod" }, execution()),
+      toolByName(host.tools, "pve_cluster_status").execute({ source: "prod" }, execution()),
+      toolByName(host.tools, "pve_node_list").execute({ source: "prod" }, execution()),
+    ]);
+    assert.equal(server.calls.length, 3);
+    for (const call of server.calls) assert.equal(queryOf(call).size, 0, `leaked params on ${call.url}`);
+  } finally {
+    await server.close();
+  }
+});
+
+test("regression: a write sent to a named source carries source in neither the form body nor the query", async () => {
+  const server = await startServer();
+  try {
+    const host = createHost({
+      value: twoTokenSources(server.baseUrl, server.baseUrl),
+      creds: { AK_PROD: "x", AK_STG: "x" },
+    });
+    apply(host.ctx, {});
+    await toolByName(host.tools, "pve_pool_create").execute({ poolid: "p1", comment: "hi", source: "staging" }, execution());
+    const [call] = server.calls;
+    assert.equal(call.method, "POST");
+    assert.equal(queryOf(call).has("source"), false);
+    assert.equal(new URLSearchParams(call.body).has("source"), false, `source leaked into the body: ${call.body}`);
+    assert.equal(new URLSearchParams(call.body).get("poolid"), "p1", "real parameters are still sent");
+  } finally {
+    await server.close();
+  }
+});
+
+test("regression: the approval prompt names the source once, in the prefix, and not as a PVE parameter", async () => {
+  const host = createHost({
+    value: twoTokenSources("http://a", "http://b"),
+    creds: { AK_PROD: "x", AK_STG: "x" },
+  });
+  apply(host.ctx, {});
+  const decision = await host.listeners.get("tools/pre-execute")(
+    { name: "pve_pool_create", arguments: { poolid: "p1", source: "staging" } },
+    async () => ({ kind: "allow" }),
+  );
+  assert.equal(decision.kind, "ask");
+  assert.match(decision.reason, /^Proxmox VE 源站「staging」：/);
+  assert.doesNotMatch(decision.reason, /"source"/, "source must not be displayed as if it were a PVE parameter");
+  assert.match(decision.reason, /"poolid":"p1"/);
+});
+
+test("resolveArgs strips every routing parameter", () => {
+  const { resolveArgs, ROUTING_PARAMS } = internals;
+  assert.ok(ROUTING_PARAMS.has("source"));
+  const out = resolveArgs({ path: "/nodes/{node}/x" }, { node: "n1", source: "prod", limit: 5 });
+  assert.equal(JSON.stringify(out), JSON.stringify({ path: "/nodes/n1/x", params: { limit: "5" } }));
+  // options 里的键是真正的 PVE 参数，不受影响（即使叫 source）。
+  const viaOptions = resolveArgs({ path: "/x" }, { options: '{"source":"pve-param"}' });
+  assert.equal(viaOptions.params.source, "pve-param");
+});

@@ -20,7 +20,7 @@ Generated from `index.js`. 230 catalog entries + 2 special write tools + 1 sourc
 | `pve_node_dns` | Read DNS settings of a node. Read-only. |
 | `pve_node_time` | Read server time and timezone. Read-only. |
 | `pve_node_hosts` | Get the contents of /etc/hosts. Read-only. |
-| `pve_node_syslog` | Read the system log of a node. Read-only. |
+| `pve_node_syslog` | Read the latest N lines of a node's system log (default 100), optionally within a `since`/`until` window or for one `service`. Read-only. |
 | `pve_node_report` | Gather various system information about a node (useful for support). Read-only. |
 | `pve_node_apt_updates` | List available package updates. Read-only. |
 | `pve_node_apt_versions` | Get package version info for important Proxmox packages. Read-only. |

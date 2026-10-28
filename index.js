@@ -735,21 +735,35 @@ const CATALOG = [
       },
     },
   ),
-  def(
-    "pve_node_syslog",
-    "GET",
-    "/nodes/{node}/syslog",
-    "Read the system log of a node. Read-only.",
-    {
-      ...NODE,
-      limit: { type: "number", description: "Max entries (default 500)." },
-      since: {
-        type: "string",
-        description: "Only entries after this date (epoch or ISO).",
+  Object.assign(
+    def(
+      "pve_node_syslog",
+      "GET",
+      "/nodes/{node}/syslog",
+      'Read the latest system log (journal) lines of a node, oldest first. "limit" is always the LATEST N lines (default 100, max 1000), so with no other argument you get the most recent entries; the lines come back in chronological order. Pass since/until to read a time window instead (then the latest N lines of that window are returned). Passing "service" filters by systemd unit and always searches a bounded window (the last 24 hours unless since is given) because the underlying PVE syslog API reads oldest-first. The result starts with a "#" header line stating the window and anything omitted. Read-only.',
+      {
+        ...NODE,
+        limit: {
+          type: "number",
+          description: "How many of the LATEST lines to return (default 100, max 1000).",
+        },
+        since: {
+          type: "string",
+          description:
+            'Only lines at or after this time. Accepts "YYYY-MM-DD", "YYYY-MM-DD HH:MM[:SS]", an ISO-8601 timestamp, or a UNIX epoch (seconds). Timestamps without a zone are read as UTC.',
+        },
+        until: {
+          type: "string",
+          description: "Only lines before this time. Same formats as since.",
+        },
+        service: {
+          type: "string",
+          description:
+            'Filter by systemd unit, e.g. "pveproxy" or "pvedaemon". Searches the last 24 hours unless since is given.',
+        },
       },
-      until: { type: "string", description: "Only entries before this date." },
-      service: { type: "string", description: "Filter by service name." },
-    },
+    ),
+    { execute: runSyslog },
   ),
   def(
     "pve_node_report",
@@ -2398,6 +2412,175 @@ const SPECIAL_WRITE_NAMES = new Set(["pve_node_execute", "pve_storage_upload"]);
 
 const BY_NAME = new Map(CATALOG.map((entry) => [entry.name, entry]));
 
+// ---------------------------------------------------------------- 节点系统日志
+//
+// PVE 有两个日志接口，行为差别很大：
+//   · GET /nodes/{node}/syslog  — `journalctl` 的**正序**流式读取：start 跳过前 N 行、
+//     limit 取 N 行（默认仅 50），**无法取「最新 N 条」**；不带时间窗口时要把整个
+//     journal 流一遍，日志跨度数月时必然超过请求超时。since/until 只接受
+//     `YYYY-MM-DD[ HH:MM[:SS]]`，不是 epoch/ISO。
+//   · GET /nodes/{node}/journal — 带 `lastentries`（最后 X 行，反向读取，开销只与 X
+//     有关，与 journal 总量无关），since/until 为 epoch 整数；PVE 7 起即有，但 7.x 没有
+//     service 过滤（8.x 才有）。`lastentries` 与 since/until 互斥。
+// 所以本工具把 `limit` 统一定义为「最新 N 条」，由插件选择后端并在必要时于本地截尾。
+const SYSLOG_DEFAULT_LIMIT = 100;
+const SYSLOG_MAX_LIMIT = 1000;
+// syslog 单次最多取回的行数（本地再截尾到 limit）。
+const SYSLOG_FETCH_CAP = 20_000;
+// 需要走 syslog（按服务过滤）却没给时间窗口时，只取最近这么久，避免全量流式读取超时。
+const SYSLOG_DEFAULT_WINDOW_SECONDS = 24 * 60 * 60;
+
+// 宽容地解析时间输入，返回 epoch 秒；无法解析时抛出带示例的错误。
+// 接受：epoch 秒 / 毫秒、`YYYY-MM-DD`、`YYYY-MM-DD HH:MM[:SS]`、ISO-8601（含 T / Z / 偏移）。
+// 没有时区的日期时间按 UTC 解释——与 PVE 节点上 journalctl 默认使用的节点本地时间
+// 可能相差若干小时，故结果里总会回显实际使用的 epoch 窗口，便于核对。
+function parseLogTime(input, label) {
+  const raw = String(input ?? "").trim();
+  if (raw === "") return undefined;
+  if (/^\d{9,13}$/.test(raw)) {
+    const n = Number(raw);
+    return raw.length >= 12 ? Math.floor(n / 1000) : n;
+  }
+  const m = /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2})(?::(\d{2}))?)?$/.exec(raw);
+  const iso = m
+    ? `${m[1]}T${m[2] ?? "00:00"}:${m[3] ?? "00"}Z`
+    : /^\d{4}-\d{2}-\d{2}T/.test(raw)
+      ? raw
+      : null;
+  const ms = iso === null ? Number.NaN : Date.parse(iso);
+  if (Number.isNaN(ms)) {
+    throw new Error(
+      `${label} must be a date such as "2026-10-27", "2026-10-27 08:30:00", an ISO-8601 timestamp, or a UNIX epoch (got ${JSON.stringify(raw)}).`,
+    );
+  }
+  return Math.floor(ms / 1000);
+}
+
+// 把 epoch 秒格式化成 syslog 接口要求的 `YYYY-MM-DD HH:MM:SS`（UTC）。
+function toSyslogDate(epochSeconds) {
+  return new Date(epochSeconds * 1000).toISOString().slice(0, 19).replace("T", " ");
+}
+
+// 决定走哪个后端，以及要发的请求。纯函数：now 由调用方注入，便于测试。
+//   · 无 service → journal：无窗口时用 lastentries 直接取最新 N 条；有窗口时按 epoch 取窗口，
+//     lastentries 与窗口互斥，故取回后本地截尾到最后 N 条。
+//   · 有 service → 只能走 syslog（PVE 7 的 journal 不支持 service），必须有时间窗口，
+//     否则默认最近 24 小时；syslog 正序，本地截尾到最后 N 条。
+function planSyslog(args, now = Date.now()) {
+  const requested = args.limit === undefined || args.limit === null || args.limit === "" ? SYSLOG_DEFAULT_LIMIT : Number(args.limit);
+  if (!Number.isFinite(requested) || requested < 1) {
+    throw new Error("limit must be a positive number of log lines.");
+  }
+  const limit = Math.min(Math.floor(requested), SYSLOG_MAX_LIMIT);
+  const since = parseLogTime(args.since, "since");
+  const until = parseLogTime(args.until, "until");
+  if (since !== undefined && until !== undefined && since >= until) {
+    throw new Error("since must be earlier than until.");
+  }
+  const service = typeof args.service === "string" ? args.service.trim() : "";
+  const nowSeconds = Math.floor(now / 1000);
+  const notes = [];
+  if (requested > SYSLOG_MAX_LIMIT) {
+    notes.push(`limit was capped at ${SYSLOG_MAX_LIMIT}`);
+  }
+
+  if (service === "") {
+    if (since === undefined && until === undefined) {
+      return {
+        backend: "journal",
+        path: "/journal",
+        params: { lastentries: String(limit) },
+        limit,
+        tail: false,
+        notes,
+        window: "the most recent entries",
+      };
+    }
+    const params = {};
+    if (since !== undefined) params.since = String(since);
+    if (until !== undefined) params.until = String(until);
+    return {
+      backend: "journal",
+      path: "/journal",
+      params,
+      limit,
+      tail: true,
+      notes,
+      window: describeWindow(since, until),
+    };
+  }
+
+  // 按服务过滤：syslog 正序且会流过整个窗口——必须限定窗口，否则超时。
+  let windowSince = since;
+  if (windowSince === undefined) {
+    windowSince = (until ?? nowSeconds) - SYSLOG_DEFAULT_WINDOW_SECONDS;
+    notes.push(
+      `no since was given, so only the last 24 hours before ${until === undefined ? "now" : "until"} were searched (the syslog endpoint reads oldest-first and cannot return "the latest N" over an unbounded range); pass since to widen or move the window`,
+    );
+  }
+  const params = { service, since: toSyslogDate(windowSince) };
+  if (until !== undefined) params.until = toSyslogDate(until);
+  // 窗口内一次取够：syslog 默认只给 50 行，且按正序，故拉到上限后在本地取最后 N 行。
+  params.limit = String(SYSLOG_FETCH_CAP);
+  return {
+    backend: "syslog",
+    path: "/syslog",
+    params,
+    limit,
+    tail: true,
+    notes,
+    window: describeWindow(windowSince, until),
+  };
+}
+
+function describeWindow(since, until) {
+  const fmt = (s) => `${toSyslogDate(s)} UTC`;
+  if (since !== undefined && until !== undefined) return `${fmt(since)} → ${fmt(until)}`;
+  if (since !== undefined) return `since ${fmt(since)}`;
+  return `until ${fmt(until)}`;
+}
+
+// 把两种后端的返回统一成文本行：journal 是字符串数组，syslog 是 [{n, t}]。
+// syslog 在无内容时会塞一行 "no content" 占位（给 ExtJS 用），这里识别并还原成空。
+function syslogLines(data) {
+  if (!Array.isArray(data)) return [];
+  const lines = data.map((row) => (row && typeof row === "object" ? String(row.t ?? "") : String(row ?? "")));
+  if (lines.length === 1 && lines[0] === "no content") return [];
+  return lines;
+}
+
+function formatSyslog(plan, data) {
+  const all = syslogLines(data);
+  const dropped = plan.tail && all.length > plan.limit ? all.length - plan.limit : 0;
+  const lines = dropped > 0 ? all.slice(-plan.limit) : all;
+  const head = [
+    `# ${lines.length} log line(s), oldest first — ${plan.window}${dropped > 0 ? `; ${dropped} older line(s) in this window omitted (showing the latest ${plan.limit})` : ""}`,
+    ...plan.notes.map((n) => `# note: ${n}`),
+  ];
+  if (plan.backend === "syslog" && all.length >= SYSLOG_FETCH_CAP) {
+    head.push(`# note: the window holds at least ${SYSLOG_FETCH_CAP} lines, so the latest ones may be missing — narrow the window with since/until`);
+  }
+  if (lines.length === 0) head.push("(no log lines in this window)");
+  return [...head, ...lines].join("\n");
+}
+
+// 带 execute 钩子的目录条目：由 buildTool 优先使用，其余字段（名称、描述、参数、
+// 只读判定）仍走通用路径，工具总数与审批判断不变。
+async function runSyslog(args, api, parentSignal) {
+  if (typeof args.node !== "string" || args.node.trim() === "") {
+    throw new Error('Required parameter "node" is missing or empty.');
+  }
+  const plan = planSyslog(args);
+  const path = `/nodes/${encodeURIComponent(args.node.trim())}${plan.path}`;
+  const data = await api("GET", path, plan.params, { parentSignal });
+  return formatSyslog(plan, data);
+}
+
+// 插件自有的路由参数：用来选择配置的 PVE 源站（见 defineSourceTool），不是 PVE API
+// 参数，绝不能进入发给 PVE 的 query / body——PVE 的参数校验会以
+// "source: property is not defined in schema" 直接返回 400。
+const ROUTING_PARAMS = new Set(["source"]);
+
 function resolveArgs(def, args) {
   const pathParamNames = [...def.path.matchAll(/\{(\w+)\}/g)].map((m) => m[1]);
   const path = def.path.replace(/\{(\w+)\}/g, (_, k) => {
@@ -2410,6 +2593,7 @@ function resolveArgs(def, args) {
   for (const [k, v] of Object.entries(args)) {
     if (v === undefined || v === null) continue;
     if (pathParamNames.includes(k)) continue;
+    if (ROUTING_PARAMS.has(k)) continue;
     if (k === "options") {
       let parsed;
       try {
@@ -2460,6 +2644,11 @@ function buildTool(def, api, defineSourceTool) {
       },
       timeoutMs: TOOL_TIMEOUT_MS,
       async execute(args, exec) {
+        // 个别条目（如 pve_node_syslog）需要在一个工具里选择后端、规整参数，
+        // 通过 def.execute 覆盖通用的「路径 + 查询」流程。
+        if (typeof def.execute === "function") {
+          return def.execute(args ?? {}, api, exec.signal);
+        }
         const { path, params } = resolveArgs(def, args ?? {});
         const data = await api(def.method, path, params, {
           parentSignal: exec.signal,
@@ -2480,6 +2669,8 @@ function approvalReasonForWrite(exec) {
     : exec.name;
   const shown = {};
   for (const [k, v] of Object.entries(exec.arguments ?? {})) {
+    // 路由参数不是 PVE 参数；目标源站由 pre-execute 在文案前缀里点名。
+    if (ROUTING_PARAMS.has(k)) continue;
     if (k === "options") {
       try {
         shown[k] = v && String(v).trim() !== "" ? JSON.parse(v) : {};
@@ -3209,6 +3400,14 @@ export const internals = Object.freeze({
   toFormValue,
   sanitize,
   resolveArgs,
+  ROUTING_PARAMS,
+  planSyslog,
+  parseLogTime,
+  formatSyslog,
+  syslogLines,
+  SYSLOG_DEFAULT_LIMIT,
+  SYSLOG_MAX_LIMIT,
+  SYSLOG_FETCH_CAP,
   formatResult,
   approvalReasonForWrite,
   firewallTools,
